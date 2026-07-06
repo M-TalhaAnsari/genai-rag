@@ -4,33 +4,41 @@ This repository contains multiple implementations of **RAG systems, LLM-based ap
 
 ---
 
-# 📁 Repository Structure
-genai-rag/
+## 📁 Repository Structure
+
+```bash
+Intro To Rag/
 │
-├── rag_systems/
+├── Projects/
 │   ├── conversational_chatbot/
 │   ├── csv_excel_bot/
 │   ├── pdf_rag_qa/
 │   ├── sql_rag/
 │   ├── invoice_extraction/
+│   ├── vector_search_engine/
 │
-├── multimodal_ai/
-│   ├── image_captioning/
-│   ├── ai_meeting_assistant/
-│   ├── ai_nutrition_coach/
-│   ├── personal_storyteller/
-│   ├── style_finder/
-│
-├── experiments/
-│   ├── prompt_engineering/
+├── Langchain-concept/
+│   ├── prompt_templates/
+│   ├── document_loaders/
 │   ├── memory_systems/
-│   ├── document_processing/
+│   ├── output_parsers/
+│
+├── MultiModal RAG/
+│   ├── AI Meeting Assistance/
+│   ├── AI-Nutrition-Coach/
+│   ├── Image-Captioning/
+│   ├── Personal-Storyteller/
+│   ├── style-finder/
 │
 ├── assets/
-│   ├── images/
+│   ├── screenshots/
 │   ├── diagrams/
 │
 └── README.md
+```
+
+---
+
 ## 🧠 RAG Systems
 
 - Conversational Chatbot
