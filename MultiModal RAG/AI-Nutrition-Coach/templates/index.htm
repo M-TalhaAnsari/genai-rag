@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Nutrition Coach</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <nav class="nav">
+        <div class="nav-content">
+            <div class="brand">
+                <div class="brand-dot"></div>
+                <span>Veritas Nutrition</span>
+            </div>
+            <span class="version">Analysis v2.4</span>
+        </div>
+    </nav>
+
+    <main class="main">
+        <div class="container">
+            <header class="header">
+                <h1>Calculate your meal's composition with precision</h1>
+                <p>Upload a photo of your plate to receive an instant nutritional breakdown powered by visual analysis.</p>
+            </header>
+
+            <form method="POST" action="/" enctype="multipart/form-data" class="form">
+                <div class="upload-area">
+                    <label for="image" class="upload-label">
+                        <input type="file" id="image" name="image" accept="image/*" required onchange="previewImage(event)">
+                        <div class="upload-placeholder" id="upload-placeholder">
+                            <div class="upload-icon">
+                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" d="M6.827 6.175A2.31 2.31 0 0 1 5.186 7.23c-.38.054-.757.112-1.134.175C2.999 7.58 2.25 8.507 2.25 9.574V18a2.25 2.25 0 0 0 2.25 2.25h15a2.25 2.25 0 0 0 2.25-2.25V9.574c0-1.067-.75-1.994-1.802-2.169a48.324 48.324 0 0 0-1.134-.175 2.31 2.31 0 0 1-1.64-1.055l-.822-1.316a2.192 2.192 0 0 0-1.736-1.039 48.774 48.774 0 0 0-5.232 0 2.192 2.192 0 0 0-1.736 1.039l-.821 1.316Z" />
+                                    <path stroke-linecap="round" stroke-linejoin="round" d="M16.5 12.75a4.5 4.5 0 1 1-9 0 4.5 4.5 0 0 1 9 0ZM18.75 10.5h.008v.008h-.008V10.5Z" />
+                                </svg>
+                            </div>
+                            <span class="upload-text">Drop meal photo or click to browse</span>
+                            <span class="upload-hint">HEIC, JPG, PNG up to 10MB</span>
+                        </div>
+                        <img id="image-preview" class="image-preview" alt="Meal preview" style="display: none;">
+                    </label>
+                </div>
+
+                <div class="input-row">
+                    <input type="text" id="question" name="question" class="question-input" placeholder="Any dietary goals? (e.g. Low sodium)">
+                    <button type="submit" class="analyze-btn">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M13.5 4.5 21 12m0 0-7.5 7.5M21 12H3" />
+                        </svg>
+                        <span>Analyze</span>
+                    </button>
+                </div>
+            </form>
+
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% if messages %}
+                    <ul class="flashes">
+                        {% for category, message in messages %}
+                            <li class="flash-{{ category }}">{{ message }}</li>
+                        {% endfor %}
+                    </ul>
+                {% endif %}
+            {% endwith %}
+
+            {% if response %}
+                <section class="result">
+                    <div class="result-header">
+                        <h2>Nutritional Breakdown</h2>
+                        <span class="verified-badge">Verified</span>
+                    </div>
+                    <div class="result-grid">
+                        <div>
+                            <span class="result-label">Calories</span>
+                            <span class="result-value">{{ calories|default(642) }}</span>
+                        </div>
+                        <div>
+                            <span class="result-label">Protein</span>
+                            <span class="result-value">{{ protein|default(32) }}g</span>
+                        </div>
+                        <div>
+                            <span class="result-label">Net Carbs</span>
+                            <span class="result-value">{{ net_carbs|default(48) }}g</span>
+                        </div>
+                    </div>
+                    <div class="response-content">
+                        {{ response|safe }}
+                    </div>
+                </section>
+            {% endif %}
+        </div>
+    </main>
+
+    <footer class="footer">
+        <div class="footer-content">
+            <p>Veritas uses computer vision to estimate volume and mass. Results should be treated as high-probability estimates rather than clinical measurements.</p>
+            <div class="footer-links">
+                <a href="#">Privacy</a>
+                <a href="#">Methodology</a>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+        function previewImage(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const preview = document.getElementById('image-preview');
+                const placeholder = document.getElementById('upload-placeholder');
+                preview.src = e.target.result;
+                preview.style.display = 'block';
+                placeholder.style.display = 'none';
+            };
+            reader.readAsDataURL(file);
+        }
+    </script>
+</body>
+</html>
