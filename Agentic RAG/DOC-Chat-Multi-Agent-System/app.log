@@ -1,2 +1,6 @@
 2026-07-13 11:58:54 | ERROR | Processing error: 'str' object has no attribute 'name'
 2026-07-13 11:59:03 | ERROR | Processing error: 'str' object has no attribute 'name'
+2026-07-13 12:03:25 | INFO | Processing and caching: Road_Map_of_BSCS,_BSIT_&_BSAI_-_45th_ACM (2).pdf
+2026-07-13 12:15:31 | INFO | Total unique chunks: 41
+2026-07-13 12:30:18 | INFO | Loading from cache: Road_Map_of_BSCS,_BSIT_&_BSAI_-_45th_ACM (2).pdf
+2026-07-13 12:30:18 | INFO | Total unique chunks: 41
