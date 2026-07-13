@@ -1,4 +1,4 @@
-# ocChat 🐥: Multi-Agent Agentic RAG System
+# DocChat 🐥: Multi-Agent Agentic RAG System
 A resilient, production-grade Retrieval-Augmented Generation (RAG) workspace utilizing a stateful multi-agent architecture orchestrated via LangGraph. DocChat leverages Docling for layout-aware document processing, ChromaDB and BM25 for hybrid retrieval, and Gemini 2.5 Flash to drive a deterministic pipeline featuring contextual answering and automated factual verification.
 
 ## 🏗️ Core Architecture & Agentic Workflow
@@ -12,6 +12,10 @@ graph TD
     D --> E[VerificationAgent]
     E -->|Contradictions / Unsupported| F[Self-Correction Cycle / Refinement]
     E -->|Verified Output| G[Streamlit Interface UI]
+
+## ScreenShot
+<img width="1915" height="867" alt="image" src="https://github.com/user-attachments/assets/45a113e8-1055-4da1-97ff-822d4512f0b7" />
+
 
 ## Ingestion Layer (DocumentProcessor): 
 Translates messy documents (PDFs, DOCX, TXT, MD) into highly structured Markdown using layout-aware parsing (Docling). Employs content-hash caching (SHA-256) to avoid reprocessing duplicate documents.
@@ -30,30 +34,26 @@ Uses strict Pydantic parsing (with_structured_output) to isolate unsupported ass
 
 ## 📁 Repository Structure
 Plaintext
-your-project-folder/
-│
-├── .env                         # Environment configurations & API tokens
-├── app.py                       # Main Streamlit Graphical UI Workspace
-├── requirements.txt             # Project dependencies
-├── config/
-│   ├── __init__.py
-│   ├── constants.py              # Operational limits (file sizes, allowed formats)
-│   └── settings.py              # Pydantic v2 application configuration setup
-│
-├── document_processor/
-│   ├── __init__.py
-│   └── file_handler.py          # Docling parser engine & SHA-256 cache controller
-│
-├── retriever/
-│   ├── __init__.py
-│   └── builder.py               # ChromaDB + BM25 Hybrid Retrieval constructor
-│
-└── agents/
-    ├── __init__.py
-    ├── relevance.py             # Context relevance triaging agent
-    ├── research.py              # Contextual grounding generation agent
-    ├── verification.py          # Pydantic structural alignment & verification agent
-    └── workflow.py              # Stateful LangGraph orchestration engine
+DOC-Chat-Multi_Agent-System/
+|-- .env                         # Environment configurations & API tokens
+|-- app.py                       # Main Streamlit Graphical UI Workspace
+|-- requirements.txt             # Project dependencies
+|-- config/
+|   |-- __init__.py
+|   |-- constants.py              # Operational limits (file sizes, allowed formats)
+|   +-- settings.py              # Pydantic v2 application configuration setup
+|-- document_processor/
+|   |-- __init__.py
+|   +-- file_handler.py          # Docling parser engine & SHA-256 cache controller
+|-- retriever/
+|   |-- __init__.py
+|   +-- builder.py               # ChromaDB + BM25 Hybrid Retrieval constructor
++-- agents/
+    |-- __init__.py
+    |-- relevance_checker.py             # Context relevance triaging agent
+    |-- research_agent.py              # Contextual grounding generation agent
+    |-- verification_agent.py          # Pydantic structural alignment & verification agent
+    +-- workflow.py              # Stateful LangGraph orchestration engine
 ### 🛠️ Installation & Setup
 
 1. Clone & Navigate to the Project
