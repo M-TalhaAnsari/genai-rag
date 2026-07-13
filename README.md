@@ -16,6 +16,13 @@ Intro To Rag/
 │   ├── sql_rag/
 │   ├── invoice_extraction/
 │   ├── vector_search_engine/
+├── Agentic RAG/
+│   ├── AI-Powered_Dtat-Analysis/
+│   ├── DOC-Chat-Multi-Agent-System/
+│   ├── LangGraph/
+│   ├── Reasoning-&-Acting-AIAgent/
+│   ├── Youtube_with_tool_calling_Agent/
+│   
 │
 ├── Langchain-concept/
 │   ├── prompt_templates/
