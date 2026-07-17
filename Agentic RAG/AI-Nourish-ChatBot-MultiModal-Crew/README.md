@@ -1,48 +1,66 @@
-AI NourishBot – Multi-Agent AI Nutrition & Recipe Assistant
+# AI NourishBot – Multi-Agent AI Nutrition & Recipe Assistant
 
 An intelligent Multi-Agent AI application that analyzes food images, estimates nutritional values, filters ingredients based on dietary preferences, and generates personalized recipe suggestions using CrewAI and Google Gemini.
 
 Built with CrewAI, FastAPI, Google Gemini, LangChain Tools, HTML, CSS, JavaScript, and Gradio-inspired AI workflows.
 
-Features
-Upload a food image
-AI-powered ingredient detection
-Nutritional analysis
-Calorie estimation
-Protein, carbohydrates and fat breakdown
-Meal health evaluation
-Personalized recipe generation
-Dietary preference filtering
-Multi-Agent AI workflow
-FastAPI backend
-Responsive web interface
-Demo
+---
+
+## Features
+
+- Upload a food image
+- AI-powered ingredient detection
+- Nutritional analysis
+- Calorie estimation
+- Protein, carbohydrates and fat breakdown
+- Meal health evaluation
+- Personalized recipe generation
+- Dietary preference filtering
+- Multi-Agent AI workflow
+- FastAPI backend
+- Responsive web interface
+
+---
+
+## Demo
 
 Upload an image of your meal and choose one of the following workflows:
 
-Nutrition Analysis
-Recipe Recommendation
+- Nutrition Analysis
+- Recipe Recommendation
 
 The application automatically processes the uploaded image using AI Agents and returns detailed insights.
 
-Tech Stack
+---
 
-Backend
-Python 3.11+
-FastAPI
-CrewAI
-LangChain
-Google Gemini 2.5 Flash
-Uvicorn
-Frontend
-HTML5
-CSS3
-JavaScript
-AI & LLM
-CrewAI
-Google Gemini Vision
-LangChain Tools
-Project Structure
+## Tech Stack
+
+### Backend
+
+- Python 3.11+
+- FastAPI
+- CrewAI
+- LangChain
+- Google Gemini 2.5 Flash
+- Uvicorn
+
+### Frontend
+
+- HTML5
+- CSS3
+- JavaScript
+
+### AI & LLM
+
+- CrewAI
+- Google Gemini Vision
+- LangChain Tools
+
+---
+
+## Project Structure
+
+```text
 AI-Nourish-ChatBot-MultiModal-Crew
 │
 ├── main.py
@@ -63,50 +81,68 @@ AI-Nourish-ChatBot-MultiModal-Crew
 ├── uploads
 │
 └── README.md
-Multi-Agent Architecture
+```
+
+---
+
+## Multi-Agent Architecture
 
 The application consists of multiple AI agents working collaboratively.
 
-Ingredient Detection Agent
+### Ingredient Detection Agent
 
 Responsibilities
 
-Detect food ingredients from uploaded images
-Clean ingredient list
+- Detect food ingredients from uploaded images
+- Clean ingredient list
 
 Tools
 
-Extract Ingredients Tool
-Ingredient Filter Tool
-Dietary Filtering Agent
+- Extract Ingredients Tool
+- Ingredient Filter Tool
+
+---
+
+### Dietary Filtering Agent
 
 Responsibilities
 
-Apply dietary restrictions
-Remove incompatible ingredients
+- Apply dietary restrictions
+- Remove incompatible ingredients
 
 Examples
 
-Vegan
-Vegetarian
-Gluten-Free
-Keto
-Nutrient Analysis Agent
+- Vegan
+- Vegetarian
+- Gluten-Free
+- Keto
+
+---
+
+### Nutrient Analysis Agent
 
 Responsibilities
 
-Estimate calories
-Estimate nutrients
-Evaluate meal health
-Generate nutrition report
-Recipe Suggestion Agent
+- Estimate calories
+- Estimate nutrients
+- Evaluate meal health
+- Generate nutrition report
+
+---
+
+### Recipe Suggestion Agent
 
 Responsibilities
 
-Generate recipes
-Respect dietary preferences
-Suggest healthy alternatives
-Workflow
+- Generate recipes
+- Respect dietary preferences
+- Suggest healthy alternatives
+
+---
+
+## Workflow
+
+```text
 User Uploads Image
         │
         ▼
@@ -122,48 +158,81 @@ Nutrient Analysis Agent
         │
         ▼
 Final AI Response
-Installation
+```
+
+---
+
+## Installation
 
 Clone the repository
 
+```bash
 git clone https://github.com/yourusername/AI-NourishBot.git
 
-cd AI-NourishBot
+cd AI-Nourish-ChatBot-MultiModal-Crew
+```
 
 Create a virtual environment
 
-Windows
+### Windows
 
+```bash
 python -m venv venv
 
 venv\Scripts\activate
+```
 
-Linux / macOS
+### Linux / macOS
 
+```bash
 python3 -m venv venv
 
 source venv/bin/activate
+```
 
 Install dependencies
 
+```bash
 pip install -r requirements.txt
-Environment Variables
+```
 
-Create a .env file
+---
 
+## Environment Variables
+
+Create a `.env` file
+
+```env
 GOOGLE_API_KEY=YOUR_GEMINI_API_KEY
-Run the Project
+```
+
+---
+
+## Run the Project
+
+```bash
 uvicorn main:app --reload
+```
 
 Open your browser
 
+```
 http://127.0.0.1:8000
+```
 
-Requirements
-Python 3.11 or newer
-Google Gemini API Key
-Internet connection
-Suggested requirements.txt
+---
+
+## Requirements
+
+- Python 3.11 or newer
+- Google Gemini API Key
+- Internet connection
+
+---
+
+## Suggested requirements.txt
+
+```text
 fastapi
 uvicorn
 crewai
@@ -175,52 +244,60 @@ pillow
 requests
 python-multipart
 jinja2
-AI Capabilities
-Food Recognition
-Ingredient Detection
-Nutrition Analysis
-Calorie Estimation
-Dietary Restriction Filtering
-Recipe Generation
-Vision AI
-Multi-Agent Collaboration
-Frontend
+```
+
+---
+
+## AI Capabilities
+
+- Food Recognition
+- Ingredient Detection
+- Nutrition Analysis
+- Calorie Estimation
+- Dietary Restriction Filtering
+- Recipe Generation
+- Vision AI
+- Multi-Agent Collaboration
+
+---
+
+## Frontend
 
 The frontend is built using
 
-HTML
-CSS
-JavaScript
+- HTML
+- CSS
+- JavaScript
 
 Users can
 
-Upload food images
-Select workflow
-Enter dietary preferences
-View AI-generated reports
-Future Improvements
-Barcode Scanner
-Nutrition History
-User Authentication
-Meal Planner
-Grocery List Generator
-PDF Nutrition Reports
-Voice Assistant
-Database Support
-Mobile Application
-Disclaimer
+- Upload food images
+- Select workflow
+- Enter dietary preferences
+- View AI-generated reports
+
+---
+
+
+
+---
+
+## Disclaimer
 
 The nutritional values, calorie estimations, and recipe suggestions generated by this application are AI-generated estimates and should not be considered professional medical or dietary advice.
 
 Always consult a qualified healthcare professional or nutritionist before making significant dietary decisions.
 
+---
 
-Author
 
-Talha Ansari
+
+---
+
+## Author
+
+**Talha Ansari**
 
 AI Engineer | Python Developer | Generative AI Enthusiast
 
-License
-
-This project is licensed under the MIT License.
+---
