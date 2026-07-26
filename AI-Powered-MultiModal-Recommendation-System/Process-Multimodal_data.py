@@ -136,6 +136,7 @@ for i in range(len(user_review_data)):
 
             # Append the generated caption to the list
             review_image_caption.append(response)
+    user_review_data[i]['image_description'] = review_image_caption
     print("All done")
 
 filename = 'augmented_user_review.json'
