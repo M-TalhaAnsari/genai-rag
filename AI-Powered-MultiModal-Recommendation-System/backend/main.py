@@ -30,8 +30,8 @@ GET  /vector-stats              ChromaDB + BM25 debug info
 
 import json
 import asyncio
-from typing import Optional
-import datetime
+from typing import Optional, List
+from datetime import datetime
 
 from fastapi import FastAPI, Depends, Query, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -42,7 +42,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from backend.db.database import AsyncSessionLocal, engine, Base
-from backend.model.models import Restaurant, Review, UserFeedback, UserProfile, SearchLog
+from backend.model.models import Restaurant, Review
 from backend.memory.long_term import (
     ConversationHistory, UserMemorySummary,
     save_conversation, get_full_memory_context
@@ -53,6 +53,8 @@ from backend import feedback as feedback_module
 from backend import analytics as analytics_module
 from backend.agents.workflow import run_recommendation_workflow
 from backend.memory import session as session_memory
+
+from pydantic import BaseModel, Field
 
 from backend.model.schemas import (
     RestaurantRequest, FeedbackRequest,RestaurantDetail,
@@ -70,6 +72,11 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
+# n8n-triggered fully automated Apify sync (no manual export/import)
+from n8n.api.routers import router as apify_automation_router
+app.include_router(apify_automation_router)
+
+
 # ── Startup ────────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
@@ -85,6 +92,8 @@ async def get_db():
     async with AsyncSessionLocal() as session:
         yield session
 
+
+# ── Health check ───────────────────────────────────────────────────────────
 
 @app.get("/", response_model=HealthResponse)
 def root():

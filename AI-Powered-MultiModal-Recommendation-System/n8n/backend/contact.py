@@ -20,7 +20,23 @@ from langchain_groq import ChatGroq
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage
 
+from fastapi import APIRouter, HTTPException, status
+from sqlalchemy import select
+
+from backend.db.database import AsyncSessionLocal
+from backend.model.models import Restaurant, Review
+from backend.retrieving import vector_store, bm25_store
+from backend.data_loader.apify_loader import normalize_apify_place   # reuse existing logic
+
 load_dotenv()
+
+
+APIFY_ACTOR_ID = "compass~crawler-google-places"   # Google Maps scraper
+APIFY_RUN_SYNC_URL = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/run-sync-get-dataset-items"
+
+DEFAULT_CITIES = ["Lahore", "Islamabad", "Karachi", "Rawalpindi"]
+DEFAULT_PER_CITY_LIMIT = 50
+
 
 # ── LLM setup ──────────────────────────────────────────────────────────────
 
@@ -196,3 +212,66 @@ def trigger_n8n_contact(
             "success": False,
             "error":   str(e)
         }
+
+
+
+def _get_apify_token() -> str:
+    token = os.environ.get("APIFY_API_TOKEN", "").strip()
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "APIFY_API_TOKEN not set. Get one free at apify.com "
+                "(Settings → Integrations → API token) and add it to .env"
+            )
+        )
+    return token
+
+
+# ── Apify API call ──────────────────────────────────────────────────────────
+
+async def _run_apify_scraper(cities: list[str], per_city_limit: int) -> list[dict]:
+    """
+    Trigger the Apify Google Maps scraper actor synchronously and
+    return the raw scraped places.
+
+    Uses run-sync-get-dataset-items — this blocks until the actor
+    finishes and returns results directly, no polling required.
+    Can take 1-5 minutes depending on how many cities/results requested.
+    """
+    token = _get_apify_token()
+
+    search_terms = [f"restaurants in {city} Pakistan" for city in cities]
+
+    actor_input = {
+        "searchStringsArray": search_terms,
+        "maxCrawledPlacesPerSearch": per_city_limit,
+        "language": "en",
+        "exportPlaceUrls": False,
+        "skipClosedPlaces": True,
+    }
+
+    async with httpx.AsyncClient(timeout=600.0) as client:   # 10 min timeout — actor runs can be slow
+        try:
+            response = await client.post(
+                APIFY_RUN_SYNC_URL,
+                params={"token": token},
+                json=actor_input,
+            )
+            response.raise_for_status()
+            return response.json()   # list of raw place dicts
+
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Apify API error {e.response.status_code}: {e.response.text[:300]}"
+            )
+        except httpx.TimeoutException:
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail=(
+                    "Apify actor run timed out (10 min limit). "
+                    "Try reducing per_city_limit or number of cities."
+                )
+            )
+
