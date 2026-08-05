@@ -58,6 +58,7 @@ from backend.model.schemas import (
     RestaurantRequest, FeedbackRequest,RestaurantDetail,
     RecommendRequest, HealthResponse, SyncResponse,
     SearchResult, SearchResponse, ReviewOut,
+    GenerateMessageRequest, ContactRequest
     
 )
 
@@ -191,7 +192,7 @@ async def load_apify():
     One-time bulk load from data/apify_export.json.
     Run this once after downloading your Apify Google Maps export.
     """
-    from backend.apify_loader import load_apify_export
+    from backend.data_loader.apify_loader import load_apify_export
     result = await load_apify_export()
     if "error" in result:
         raise HTTPException(
@@ -543,29 +544,6 @@ def vector_stats():
     }
 
 
-# ── Contact restaurant via n8n ─────────────────────────────────────────────
-
-class GenerateMessageRequest(BaseModel):
-    restaurant_id:   int
-    restaurant_name: str
-    cuisine:         str
-    city:            str
-    user_name:       str
-    user_query:      str
-    contact_method:  str = "email"   # "email" | "whatsapp" | "booking"
-
-
-class ContactRequest(BaseModel):
-    restaurant_id:   int
-    restaurant_name: str
-    cuisine:         str
-    city:            str
-    email:           Optional[str] = None
-    phone:           Optional[str] = None
-    website:         Optional[str] = None
-    message:         str            # the approved/edited message
-    user_name:       str
-    user_query:      str
 
 
 @app.post("/generate-message")
@@ -581,7 +559,7 @@ async def generate_message(request: GenerateMessageRequest):
       whatsapp → casual and brief
       booking  → concise reservation request
     """
-    from backend.contact import generate_contact_message
+    from n8n.backend.contact import generate_contact_message
 
     # Determine best contact method based on what restaurant has
     result = await _get_restaurant_contact_method(request.restaurant_id)
@@ -618,7 +596,7 @@ async def contact_restaurant(
 
     The routing logic lives in n8n — this endpoint just fires the webhook.
     """
-    from backend.contact import trigger_n8n_contact
+    from n8n.backend.contact import trigger_n8n_contact
 
     result = trigger_n8n_contact(
         restaurant_id=request.restaurant_id,
@@ -677,7 +655,7 @@ async def get_review_summary_endpoint(restaurant_id: int):
     Includes quality dimensions, recency info, fake signal warnings.
     Returns 404 if no summary has been generated yet.
     """
-    from backend.vector_store import get_review_summary
+    from backend.retrieving.vector_store import get_review_summary
     data = get_review_summary(restaurant_id)
     if not data:
         raise HTTPException(
@@ -707,8 +685,8 @@ async def summarise_restaurant_reviews(
 
     Can also be called as a batch via /summarise-all-reviews.
     """
-    from backend.review_summariser import summarise_reviews
-    from backend.vector_store import upsert_review_summary
+    from backend.data_loader.review_summariser import summarise_reviews
+    from backend.retrieving.vector_store import upsert_review_summary
 
     # Load restaurant
     r_result = await db.execute(
@@ -765,8 +743,8 @@ async def summarise_all_reviews(db: AsyncSession = Depends(get_db)):
     Run this once after /load-apify to populate the review collection.
     Takes time proportional to number of restaurants × LLM latency.
     """
-    from backend.review_summariser import summarise_reviews
-    from backend.vector_store import upsert_review_summary, get_review_summary
+    from backend.data_loader.review_summariser import summarise_reviews
+    from backend.retrieving.vector_store import upsert_review_summary, get_review_summary
 
     r_result = await db.execute(select(Restaurant))
     restaurants = r_result.scalars().all()
@@ -849,7 +827,7 @@ async def search_by_review(
       - disclaimer and fake signal warnings if applicable
       - most_recent_review date so you know how fresh the data is
     """
-    from backend.vector_store import search_by_review_sentiment, review_collection_count
+    from backend.retrieving.vector_store import search_by_review_sentiment, review_collection_count
 
     if review_collection_count() == 0:
         raise HTTPException(
@@ -912,7 +890,7 @@ async def search_full(
       /search/full?q=clean family restaurant Islamabad&w_review=0.6
       /search/full?q=rooftop cafe Karachi&user_id=ahmed_123
     """
-    from backend.vector_store import (
+    from backend.retrieving.vector_store import (
         search_by_review_sentiment, review_collection_count
     )
 

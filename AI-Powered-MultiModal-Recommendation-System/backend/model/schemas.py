@@ -107,3 +107,28 @@ class RestaurantDetail(BaseModel):
     source: Optional[str]
     is_embedded: bool
     reviews: List[ReviewOut] = []
+
+
+# ── Contact restaurant via n8n ─────────────────────────────────────────────
+
+class GenerateMessageRequest(BaseModel):
+    restaurant_id:   int
+    restaurant_name: str
+    cuisine:         str
+    city:            str
+    user_name:       str
+    user_query:      str
+    contact_method:  str = "email"   # "email" | "whatsapp" | "booking"
+
+
+class ContactRequest(BaseModel):
+    restaurant_id:   int
+    restaurant_name: str
+    cuisine:         str
+    city:            str
+    email:           Optional[str] = None
+    phone:           Optional[str] = None
+    website:         Optional[str] = None
+    message:         str            # the approved/edited message
+    user_name:       str
+    user_query:      str
