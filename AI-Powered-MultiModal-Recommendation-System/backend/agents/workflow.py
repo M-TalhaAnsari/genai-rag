@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from backend.agents.configs import call_agent
-from backend import retrieval as retrieval_module
+from backend.retrieving import retrieval as retrieval_module
 
 
 # ── State initialiser ──────────────────────────────────────────────────────

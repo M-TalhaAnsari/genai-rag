@@ -37,9 +37,9 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.database import AsyncSessionLocal, engine, Base
-from backend.models import Restaurant, Review
-from backend import vector_store, bm25_store
+from backend.db.database import AsyncSessionLocal, engine, Base
+from backend.model.models import Restaurant, Review
+from backend.retrieving import vector_store, bm25_store
 
 APIFY_EXPORT_PATH = "data/apify_export.json"
 
@@ -269,8 +269,8 @@ async def load_apify_export(filepath: str = APIFY_EXPORT_PATH) -> dict:
     # that have reviews — this populates the ChromaDB review_summaries collection
     summarised = 0
     if newly_inserted:
-        from backend.review_summariser import summarise_reviews
-        from backend.vector_store import upsert_review_summary
+        from backend.data_loader.review_summariser import summarise_reviews
+        from backend.retrieving.vector_store import upsert_review_summary
 
         async with AsyncSessionLocal() as db:
             for record, reviews in newly_inserted:
