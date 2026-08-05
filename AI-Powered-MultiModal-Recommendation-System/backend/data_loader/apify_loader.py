@@ -37,9 +37,9 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.db.database import AsyncSessionLocal, engine, Base
-from backend.model.models import Restaurant, Review
-from backend.retrieving import vector_store, bm25_store
+from backend.database import AsyncSessionLocal, engine, Base
+from backend.models import Restaurant, Review
+from backend import vector_store, bm25_store
 
 APIFY_EXPORT_PATH = "data/apify_export.json"
 
@@ -265,12 +265,43 @@ async def load_apify_export(filepath: str = APIFY_EXPORT_PATH) -> dict:
     print(f"[apify] Done: {inserted} inserted, {skipped} skipped, "
           f"{reviews_inserted} reviews, {embedded} embedded")
 
+    # Auto-trigger review summarisation for all newly inserted restaurants
+    # that have reviews — this populates the ChromaDB review_summaries collection
+    summarised = 0
+    if newly_inserted:
+        from backend.review_summariser import summarise_reviews
+        from backend.vector_store import upsert_review_summary
+
+        async with AsyncSessionLocal() as db:
+            for record, reviews in newly_inserted:
+                if not reviews:
+                    continue
+                try:
+                    summary_data = summarise_reviews(
+                        restaurant_name=record.name,
+                        cuisine=record.cuisine,
+                        reviews=reviews
+                    )
+                    upsert_review_summary(
+                        restaurant_id=record.id,
+                        restaurant_name=record.name,
+                        cuisine=record.cuisine,
+                        city=record.city,
+                        **summary_data
+                    )
+                    summarised += 1
+                except Exception as e:
+                    errors.append(f"summarise {record.name}: {e}")
+
+    print(f"[apify] Review summaries generated: {summarised}")
+
     return {
-        "inserted": inserted,
-        "skipped": skipped,
-        "reviews_inserted": reviews_inserted,
-        "embedded": embedded,
-        "errors": errors[:10],   # cap error list
+        "inserted":           inserted,
+        "skipped":            skipped,
+        "reviews_inserted":   reviews_inserted,
+        "embedded":           embedded,
+        "reviews_summarised": summarised,
+        "errors":             errors[:10],
     }
 
 

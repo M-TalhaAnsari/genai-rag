@@ -31,7 +31,7 @@ GET  /vector-stats              ChromaDB + BM25 debug info
 import json
 import asyncio
 from typing import Optional
-
+import datetime
 
 from fastapi import FastAPI, Depends, Query, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -60,6 +60,7 @@ from backend.model.schemas import (
     SearchResult, SearchResponse, ReviewOut,
     
 )
+
 app = FastAPI(
     title="Connoisseur Restaurant API",
     description="AI-powered restaurant discovery for Pakistan",
@@ -67,7 +68,6 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc"
 )
-
 
 # ── Startup ────────────────────────────────────────────────────────────────
 
@@ -85,14 +85,10 @@ async def get_db():
         yield session
 
 
-
-
-# ── Health check ───────────────────────────────────────────────────────────
-
 @app.get("/", response_model=HealthResponse)
 def root():
     return HealthResponse(
-        status="ok"
+        status="ok",
         version="4.0.0",
         timestamp=datetime.utcnow().isoformat()
     )
@@ -195,7 +191,7 @@ async def load_apify():
     One-time bulk load from data/apify_export.json.
     Run this once after downloading your Apify Google Maps export.
     """
-    from backend.data_loader.apify_loader import load_apify_export
+    from backend.apify_loader import load_apify_export
     result = await load_apify_export()
     if "error" in result:
         raise HTTPException(
@@ -544,4 +540,474 @@ def vector_stats():
         "chroma_count":    vector_store.collection_count(),
         "bm25_index_exists": bm25_store.index_exists(),
         "active_sessions": session_memory.active_sessions()
+    }
+
+
+# ── Contact restaurant via n8n ─────────────────────────────────────────────
+
+class GenerateMessageRequest(BaseModel):
+    restaurant_id:   int
+    restaurant_name: str
+    cuisine:         str
+    city:            str
+    user_name:       str
+    user_query:      str
+    contact_method:  str = "email"   # "email" | "whatsapp" | "booking"
+
+
+class ContactRequest(BaseModel):
+    restaurant_id:   int
+    restaurant_name: str
+    cuisine:         str
+    city:            str
+    email:           Optional[str] = None
+    phone:           Optional[str] = None
+    website:         Optional[str] = None
+    message:         str            # the approved/edited message
+    user_name:       str
+    user_query:      str
+
+
+@app.post("/generate-message")
+async def generate_message(request: GenerateMessageRequest):
+    """
+    Generate a draft contact message from the user to a restaurant.
+
+    Called when the user clicks 'Select' on a restaurant card.
+    Returns a draft message the user can approve or edit before sending.
+
+    The message tone adapts to the contact channel:
+      email    → formal
+      whatsapp → casual and brief
+      booking  → concise reservation request
+    """
+    from backend.contact import generate_contact_message
+
+    # Determine best contact method based on what restaurant has
+    result = await _get_restaurant_contact_method(request.restaurant_id)
+    contact_method = result.get("method", request.contact_method)
+
+    draft = generate_contact_message(
+        restaurant_name=request.restaurant_name,
+        cuisine=request.cuisine,
+        city=request.city,
+        user_name=request.user_name,
+        user_query=request.user_query,
+        contact_method=contact_method
+    )
+
+    return {
+        "draft_message":   draft,
+        "contact_method":  contact_method,
+        "restaurant_name": request.restaurant_name
+    }
+
+
+@app.post("/contact-restaurant")
+async def contact_restaurant(
+    request: ContactRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Send the approved message to the restaurant via n8n.
+
+    n8n receives the full payload and routes to:
+      - Email    if restaurant.email is set
+      - WhatsApp if restaurant.phone is set
+      - Booking  if restaurant.website is set
+
+    The routing logic lives in n8n — this endpoint just fires the webhook.
+    """
+    from backend.contact import trigger_n8n_contact
+
+    result = trigger_n8n_contact(
+        restaurant_id=request.restaurant_id,
+        restaurant_name=request.restaurant_name,
+        cuisine=request.cuisine,
+        city=request.city,
+        email=request.email,
+        phone=request.phone,
+        website=request.website,
+        message=request.message,
+        user_name=request.user_name,
+        user_query=request.user_query
+    )
+
+    if not result["success"]:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=result.get("error", "n8n webhook failed.")
+        )
+
+    return result
+
+
+# ── Internal helper ────────────────────────────────────────────────────────
+
+async def _get_restaurant_contact_method(restaurant_id: int) -> dict:
+    """
+    Look up a restaurant's available contact channels and return
+    the best one for the draft message tone.
+    """
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Restaurant).where(Restaurant.id == restaurant_id)
+        )
+        r = result.scalars().first()
+
+    if not r:
+        return {"method": "email"}
+
+    if r.email:
+        return {"method": "email",    "value": r.email}
+    if r.phone:
+        return {"method": "whatsapp", "value": r.phone}
+    if r.website:
+        return {"method": "booking",  "value": r.website}
+
+    return {"method": "email"}
+
+
+# ── Review summarisation endpoint ──────────────────────────────────────────
+
+@app.get("/restaurants/{restaurant_id}/review-summary")
+async def get_review_summary_endpoint(restaurant_id: int):
+    """
+    Fetch the stored review summary for one restaurant.
+    Includes quality dimensions, recency info, fake signal warnings.
+    Returns 404 if no summary has been generated yet.
+    """
+    from backend.vector_store import get_review_summary
+    data = get_review_summary(restaurant_id)
+    if not data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No review summary for restaurant {restaurant_id}. "
+                   f"Call POST /restaurants/{restaurant_id}/summarise-reviews first."
+        )
+    return data
+
+
+@app.post("/restaurants/{restaurant_id}/summarise-reviews")
+async def summarise_restaurant_reviews(
+    restaurant_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Generate a cautious review summary for a restaurant and embed it.
+
+    Call this after loading Apify data which includes raw reviews.
+    The summary is stored in the ChromaDB "restaurant_reviews" collection.
+
+    The summary:
+      - Only states what MULTIPLE reviews agree on
+      - Flags mixed/polarised reviews explicitly
+      - Never fabricates details
+      - Is shown to users WITH a disclaimer
+
+    Can also be called as a batch via /summarise-all-reviews.
+    """
+    from backend.review_summariser import summarise_reviews
+    from backend.vector_store import upsert_review_summary
+
+    # Load restaurant
+    r_result = await db.execute(
+        select(Restaurant).where(Restaurant.id == restaurant_id)
+    )
+    restaurant = r_result.scalars().first()
+    if not restaurant:
+        raise HTTPException(status_code=404, detail="Restaurant not found.")
+
+    # Load reviews
+    rv_result = await db.execute(
+        select(Review).where(Review.restaurant_id == restaurant_id)
+    )
+    reviews = rv_result.scalars().all()
+    review_dicts = [
+        {
+            "rating":         r.rating,
+            "text":           r.text,
+            "published_date": r.published_date,
+            "source":         r.source
+        }
+        for r in reviews
+    ]
+
+    # Generate cautious summary
+    summary_data = summarise_reviews(
+        restaurant_name=restaurant.name,
+        cuisine=restaurant.cuisine,
+        reviews=review_dicts
+    )
+
+    # Embed and store
+    upsert_review_summary(
+        restaurant_id=restaurant_id,
+        restaurant_name=restaurant.name,
+        cuisine=restaurant.cuisine,
+        city=restaurant.city,
+        **summary_data
+    )
+
+    return {
+        "restaurant_id":   restaurant_id,
+        "restaurant_name": restaurant.name,
+        "summary_data":    summary_data
+    }
+
+
+@app.post("/summarise-all-reviews")
+async def summarise_all_reviews(db: AsyncSession = Depends(get_db)):
+    """
+    Batch generate review summaries for all restaurants that have reviews
+    but no summary yet in ChromaDB.
+
+    Run this once after /load-apify to populate the review collection.
+    Takes time proportional to number of restaurants × LLM latency.
+    """
+    from backend.review_summariser import summarise_reviews
+    from backend.vector_store import upsert_review_summary, get_review_summary
+
+    r_result = await db.execute(select(Restaurant))
+    restaurants = r_result.scalars().all()
+
+    done, skipped, errors = 0, 0, []
+
+    for restaurant in restaurants:
+        # Skip if already summarised
+        if get_review_summary(restaurant.id):
+            skipped += 1
+            continue
+
+        rv_result = await db.execute(
+            select(Review).where(Review.restaurant_id == restaurant.id)
+        )
+        reviews = rv_result.scalars().all()
+
+        if not reviews:
+            skipped += 1
+            continue
+
+        try:
+            review_dicts = [
+                {"rating": r.rating, "text": r.text,
+                 "published_date": r.published_date, "source": r.source}
+                for r in reviews
+            ]
+            summary_data = summarise_reviews(
+                restaurant_name=restaurant.name,
+                cuisine=restaurant.cuisine,
+                reviews=review_dicts
+            )
+            upsert_review_summary(
+                restaurant_id=restaurant.id,
+                restaurant_name=restaurant.name,
+                cuisine=restaurant.cuisine,
+                city=restaurant.city,
+                **summary_data
+            )
+            done += 1
+        except Exception as e:
+            errors.append(f"{restaurant.name}: {e}")
+
+    return {
+        "summarised": done,
+        "skipped":    skipped,
+        "errors":     errors[:10]
+    }
+
+
+# ── Search by review sentiment ─────────────────────────────────────────────
+
+@app.get("/search/by-review")
+async def search_by_review(
+    q: str = Query(..., min_length=1,
+                   description="e.g. 'great service and clean tables'"),
+    top_k: int = Query(default=5, ge=1, le=20),
+    min_confidence: str = Query(
+        default="low",
+        description="Filter by confidence level: low | medium | high"
+    )
+):
+    """
+    Search restaurants by their review summary content.
+
+    Unlike /search which matches on restaurant identity (name, cuisine, city),
+    this endpoint matches on what customers actually said — food quality,
+    cleanliness, service, vibe, and menu variety.
+
+    Examples:
+      /search/by-review?q=clean tables and fast service
+      /search/by-review?q=great biryani fresh ingredients
+      /search/by-review?q=quiet atmosphere good for families
+      /search/by-review?q=avoid dirty kitchen
+
+    Each result includes:
+      - review_summary: the cautious 2-sentence summary
+      - confidence: low | medium | high (based on review count)
+      - avg_rating and weighted_rating (recency-weighted)
+      - disclaimer and fake signal warnings if applicable
+      - most_recent_review date so you know how fresh the data is
+    """
+    from backend.vector_store import search_by_review_sentiment, review_collection_count
+
+    if review_collection_count() == 0:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "No review summaries indexed yet. "
+                "Run POST /summarise-all-reviews after loading restaurant data."
+            )
+        )
+
+    confidence_rank = {"none": 0, "low": 1, "medium": 2, "high": 3}
+    min_rank = confidence_rank.get(min_confidence, 1)
+
+    results = search_by_review_sentiment(query=q, top_k=top_k * 2)
+
+    # Filter by minimum confidence
+    results = [
+        r for r in results
+        if confidence_rank.get(r.get("confidence", "none"), 0) >= min_rank
+    ][:top_k]
+
+    return {
+        "query":        q,
+        "result_count": len(results),
+        "source":       "review_summaries",
+        "results":      results
+    }
+
+
+# ── Hybrid search including review signal ──────────────────────────────────
+
+@app.get("/search/full")
+async def search_full(
+    q: str          = Query(..., min_length=1),
+    top_k: int      = Query(default=5, ge=1, le=20),
+    user_id: Optional[str] = Query(default=None),
+    w_identity: float = Query(default=0.6, ge=0.0, le=1.0,
+                              description="Weight for identity search (name/cuisine/city)"),
+    w_review: float   = Query(default=0.4, ge=0.0, le=1.0,
+                              description="Weight for review sentiment search"),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Three-signal hybrid search:
+      Signal 1: BM25 keyword search        (identity)
+      Signal 2: ChromaDB dense search      (identity)
+      Signal 3: ChromaDB review sentiment  (what customers said)
+
+    Signals 1+2 are fused with RRF then combined with Signal 3
+    using configurable weights.
+
+    Default weights: 60% identity, 40% review sentiment.
+    Adjust w_identity and w_review to change the balance.
+
+    Restaurants with fake review warnings have their review
+    signal weight automatically reduced by 50%.
+
+    Examples:
+      /search/full?q=best biryani Lahore
+      /search/full?q=clean family restaurant Islamabad&w_review=0.6
+      /search/full?q=rooftop cafe Karachi&user_id=ahmed_123
+    """
+    from backend.vector_store import (
+        search_by_review_sentiment, review_collection_count
+    )
+
+    if vector_store.collection_count() == 0:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No restaurants indexed. Run /restaurant-sync first."
+        )
+
+    # Signal 1+2: existing hybrid retrieval (BM25 + dense, RRF fused)
+    identity_results = retrieval.hybrid_search(query=q, top_k=top_k * 2)
+
+    # Signal 3: review sentiment (only if collection exists)
+    review_results = []
+    if review_collection_count() > 0:
+        review_results = search_by_review_sentiment(query=q, top_k=top_k * 2)
+
+    # Merge by restaurant_id
+    scores: dict[int, dict] = {}
+
+    for rank, r in enumerate(identity_results, start=1):
+        rid = r["restaurant_id"]
+        scores[rid] = {
+            "restaurant_id":   rid,
+            "name":            r["name"],
+            "cuisine":         r["cuisine"],
+            "city":            r["city"],
+            "identity_score":  round(w_identity * (1.0 / (60 + rank)), 6),
+            "review_score":    0.0,
+            "combined_score":  0.0,
+            "review_summary":  None,
+            "review_disclaimer": None,
+            "has_fake_signals": False,
+            "most_recent_review": None,
+        }
+
+    for rank, r in enumerate(review_results, start=1):
+        rid = r["restaurant_id"]
+
+        # Reduce review weight for restaurants with fake signals
+        effective_w = w_review * (0.5 if r.get("has_fake_signals") else 1.0)
+        review_contribution = effective_w * (1.0 / (60 + rank))
+
+        if rid in scores:
+            scores[rid]["review_score"]     = round(review_contribution, 6)
+            scores[rid]["review_summary"]   = r.get("review_summary")
+            scores[rid]["review_disclaimer"] = r.get("disclaimer")
+            scores[rid]["has_fake_signals"] = r.get("has_fake_signals", False)
+            scores[rid]["most_recent_review"] = r.get("most_recent_review")
+        else:
+            scores[rid] = {
+                "restaurant_id":    rid,
+                "name":             r["name"],
+                "cuisine":          r["cuisine"],
+                "city":             r["city"],
+                "identity_score":   0.0,
+                "review_score":     round(review_contribution, 6),
+                "combined_score":   0.0,
+                "review_summary":   r.get("review_summary"),
+                "review_disclaimer": r.get("disclaimer"),
+                "has_fake_signals": r.get("has_fake_signals", False),
+                "most_recent_review": r.get("most_recent_review"),
+            }
+
+    # Compute combined score and sort
+    for rid in scores:
+        scores[rid]["combined_score"] = round(
+            scores[rid]["identity_score"] + scores[rid]["review_score"], 6
+        )
+
+    ranked = sorted(
+        scores.values(),
+        key=lambda x: x["combined_score"],
+        reverse=True
+    )[:top_k]
+
+    # Personalisation
+    personalised = False
+    if user_id:
+        profile = await feedback_module.get_profile(db, user_id)
+        if profile:
+            ranked = feedback_module.apply_profile_boost(ranked, profile)
+            personalised = True
+        session_memory.add_query(user_id, q)
+
+    await analytics_module.log_search(
+        db=db, query=q,
+        result_count=len(ranked),
+        user_id=user_id
+    )
+
+    return {
+        "query":        q,
+        "result_count": len(ranked),
+        "personalised": personalised,
+        "weights":      {"identity": w_identity, "review": w_review},
+        "results":      ranked
     }

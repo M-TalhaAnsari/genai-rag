@@ -2,6 +2,7 @@ from pydantic import BaseModel, Field
 from typing import Optional, List
 # ── Request models ─────────────────────────────────────────────────────────
 
+
 class RestaurantInput(BaseModel):
     name: str
     cuisine: str
@@ -42,8 +43,6 @@ class RecommendRequest(BaseModel):
     user_id: Optional[str] = None
     top_k:   int           = Field(default=5, ge=1, le=10)
 
-
-# ── Response models ────────────────────────────────────────────────────────
 
 class HealthResponse(BaseModel):
     status: str
@@ -108,5 +107,3 @@ class RestaurantDetail(BaseModel):
     source: Optional[str]
     is_embedded: bool
     reviews: List[ReviewOut] = []
-
-
