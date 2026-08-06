@@ -1,5 +1,5 @@
 """
-backend/apify_automation.py
+n8n/api/routers.py
 ------------------------------
 Fully automated Apify data pipeline — NO manual export/import step.
 
@@ -32,31 +32,52 @@ n8n workflow (simple):
 No manual file download. No manual upload. Fully automated.
 """
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.db.database import AsyncSessionLocal
 from backend.model.models import Restaurant, Review
 from backend.retrieving import vector_store, bm25_store
-from backend.data_loader.apify_loader import normalize_apify_place, _load_places # reuse existing logic
+from backend.data_loader.apify_loader import  _load_places # reuse existing logic
+
+from backend.model.schemas import(
+    GenerateMessageRequest, ContactRequest
+)
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from backend.model.models import Restaurant
+from contact_method.service import generate_whatsapp_url
+from contact_method.service import generate_gmail_compose_url
+
+from contact_method.schemas import (
+    EmailComposeRequest,
+    EmailComposeResponse,
+    WhatsAppRequest,
+)
+from sqlalchemy import select
 
 
-from n8n.backend.contact import _run_apify_scraper_resilient
-router = APIRouter(prefix="/n8n", tags=["n8n automation"])
+from contact_method.service import _run_apify_scraper_resilient
 
+contact_router = APIRouter(prefix="/n8n", tags=["n8n automation"])
+
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        yield session
 
 
 APIFY_ACTOR_ID = "compass~crawler-google-places"   # Google Maps scraper
 
-DEFAULT_CITIES = ["Lahore", "Islamabad", "Karachi", "Rawalpindi"]
-DEFAULT_PER_CITY_LIMIT = 50
-
+DEFAULT_CITIES = ["Lahore", "Islamabad", "Karachi", "Rawalpindi","Murree","Abbotabad"]
 
 APIFY_ACTOR_ID = "compass~crawler-google-places"
 
 RECOMMENDED_INCREMENTAL_LIMIT = 15   # scheduled weekly re-sync — cheaper
 
-@router.post("/sync-apify")
+@contact_router.post("/sync-apify")
 async def sync_apify(
     cities: str = None,
     per_city_limit: int = RECOMMENDED_INCREMENTAL_LIMIT
@@ -123,7 +144,7 @@ async def sync_apify(
 
 # ── Status check ─────────────────────────────────────────────────────────
 
-@router.get("/apify-status")
+@contact_router.get("/apify-status")
 async def apify_status():
     """Quick health check — current data volume without triggering a sync."""
     async with AsyncSessionLocal() as db:
@@ -143,4 +164,134 @@ async def apify_status():
         "by_source":         by_source,
         "chroma_vectors":    vector_store.collection_count(),
         "bm25_index_exists": bm25_store.index_exists(),
+    }
+
+@contact_router.post("/generate-message")
+async def generate_message(request: GenerateMessageRequest):
+    """
+    Generate draft contact messages for email and WhatsApp.
+
+    Called when the user clicks 'Select' on a restaurant card.
+    Returns drafts that the user can approve or edit before sending.
+    """
+
+    from contact_method.service import generate_contact_messages
+    from contact_method.service import _get_restaurant_contact_method
+
+
+    # Check available restaurant contact options
+    contact_info = await _get_restaurant_contact_method(
+        request.restaurant_id
+    )
+
+
+    messages = generate_contact_messages(
+        restaurant_name=request.restaurant_name,
+        cuisine=request.cuisine,
+        city=request.city,
+        user_name=request.user_name,
+        user_query=request.user_query
+    )
+
+
+    return {
+        "restaurant_name": request.restaurant_name,
+
+        "contact_method": contact_info.get("method"),
+
+        "email_message": messages["email_message"],
+
+        "whatsapp_message": messages["whatsapp_message"],
+
+        "restaurant_website":contact_info.get("website",None),
+
+    }
+
+
+# @contact_router.post("/contact-restaurant")
+# async def contact_restaurant(
+#     request: ContactRequest,
+#     db: AsyncSession = Depends(get_db)
+# ):
+#     """
+#     Send the approved message to the restaurant via n8n.
+
+#     n8n receives the full payload and routes to:
+#       - Email    if restaurant.email is set
+#       - WhatsApp if restaurant.phone is set
+#       - Booking  if restaurant.website is set
+
+#     The routing logic lives in n8n — this endpoint just fires the webhook.
+#     """
+#     from n8n.backend.contact import trigger_n8n_contact
+
+#     result = trigger_n8n_contact(
+#         restaurant_id=request.restaurant_id,
+#         restaurant_name=request.restaurant_name,
+#         cuisine=request.cuisine,
+#         city=request.city,
+#         email=request.email,
+#         phone=request.phone,
+#         website=request.website,
+#         message=request.message,
+#         user_name=request.user_name,
+#         user_query=request.user_query
+#     )
+
+    
+
+    # if not result["success"]:
+    #     raise HTTPException(
+    #         status_code=status.HTTP_502_BAD_GATEWAY,
+    #         detail=result.get("error", "n8n webhook failed.")
+    #     )
+
+    # return result
+
+
+@contact_router.post("/whatsapp-url/{restaurant_id}")
+async def create_whatsapp_url(
+    restaurant_id: int,
+    request: WhatsAppRequest,
+    db: AsyncSession = Depends(get_db),
+):
+
+    result = await db.execute(
+        select(Restaurant).where(Restaurant.id == restaurant_id)
+    )
+
+    restaurant = result.scalar_one_or_none()
+
+    if restaurant is None:
+        raise HTTPException(404, "Restaurant not found.")
+
+    response = await generate_whatsapp_url(
+        db=db,
+        restaurant=restaurant,
+        message=request.message,
+    )
+
+    if not response["success"]:
+        raise HTTPException(400, response["error"])
+
+    return response
+
+
+@contact_router.post(
+    "/generate-compose-url",
+    response_model=EmailComposeResponse
+)
+def create_email_url(
+    data: EmailComposeRequest
+):
+
+    gmail_url = generate_gmail_compose_url(
+        recipient_email=data.email,
+        message=data.message,
+        subject=data.subject
+    )
+
+    return {
+        "email": data.email,
+        "gmail_url": gmail_url
     }

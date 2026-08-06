@@ -19,6 +19,11 @@ from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage
+from urllib.parse import quote, urlencode
+from sqlalchemy.ext.asyncio import AsyncSession
+from backend.model.models import Restaurant
+
+import asyncio 
 
 from fastapi import HTTPException, status
 
@@ -35,7 +40,7 @@ APIFY_RUN_STATUS_URL    = "https://api.apify.com/v2/actor-runs/{run_id}"
 APIFY_DATASET_ITEMS_URL = "https://api.apify.com/v2/datasets/{dataset_id}/items"
 
 
-TARGET_COUNTRY_CODE = "PK"
+TARGET_COUNTRY_CODE = "pk"
 
 # Polling config
 POLL_INTERVAL_SECONDS = 10
@@ -68,155 +73,263 @@ def _invoke_llm(messages: list) -> str:
 
 # ── Message generator ──────────────────────────────────────────────────────
 
-def generate_contact_message(
+from langchain_core.messages import SystemMessage, HumanMessage
+import json
+
+
+def generate_contact_messages(
     restaurant_name: str,
     cuisine: str,
     city: str,
     user_name: str,
-    user_query: str,
-    contact_method: str          # "email" | "whatsapp" | "booking"
-) -> str:
+    user_query: str
+) -> dict:
     """
-    Generate a polite, natural contact message from the user to the restaurant.
-
-    The message is tailored to:
-      - The restaurant's name and cuisine
-      - What the user was searching for (their original query)
-      - The contact channel (email is formal, WhatsApp is casual)
+    Generate contact messages for both email and WhatsApp.
 
     Args:
-        restaurant_name: Name of the restaurant being contacted
-        cuisine:         Cuisine type of the restaurant
-        city:            City the restaurant is in
-        user_name:       Name of the user sending the message
-        user_query:      What the user originally searched for
-        contact_method:  "email" | "whatsapp" | "booking"
+        restaurant_name: Name of restaurant
+        cuisine: Restaurant cuisine type
+        city: Restaurant city
+        user_name: Customer name
+        user_query: Original user request/search
 
     Returns:
-        A ready-to-send message string the user can approve or edit.
+        Dictionary containing email and whatsapp messages.
     """
-    tone = {
-        "email":    "formal and professional",
-        "whatsapp": "friendly and conversational, keep it brief",
-        "booking":  "formal and concise, focus on reservation details"
-    }.get(contact_method, "polite and friendly")
 
-    system_prompt = """You are writing a contact message from a customer to a restaurant.
-Write ONLY the message body — no subject line, no labels, no explanation.
-The message should sound natural, like a real person wrote it.
-Keep it under 100 words."""
+    system_prompt = """
+You are an assistant that writes customer messages to restaurants.
 
-    user_prompt = f"""Write a {tone} message from {user_name} to {restaurant_name},
-a {cuisine} restaurant in {city}.
+Generate two versions:
 
-The customer was looking for: "{user_query}"
+1. Email:
+- Formal and professional
+- Include greeting
+- Explain customer requirement clearly
+- Ask if restaurant can accommodate
+- End politely with customer's name
+- Maximum 120 words
 
-The message should:
-- Greet the restaurant
-- Mention what they are interested in (based on their search)
-- Ask if the restaurant can accommodate them
-- End politely with the customer's name
+2. WhatsApp:
+- Friendly and conversational
+- Short and natural
+- Suitable for WhatsApp chat
+- Ask the restaurant about availability
+- End politely with customer's name
+- Maximum 60 words
 
-Write ONLY the message. Nothing else."""
 
-    return _invoke_llm([
+Return ONLY valid JSON.
+No markdown.
+No explanation.
+
+Format:
+
+{
+    "email_message": "...",
+    "whatsapp_message": "..."
+}
+"""
+
+
+    user_prompt = f"""
+Create messages for this customer:
+
+Customer name:
+{user_name}
+
+Restaurant:
+{restaurant_name}
+
+Cuisine:
+{cuisine}
+
+City:
+{city}
+
+Customer request:
+{user_query}
+
+Generate both email and WhatsApp messages.
+"""
+
+
+    response = _invoke_llm([
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_prompt),
     ])
 
 
-# ── n8n webhook caller ─────────────────────────────────────────────────────
+    try:
+        messages = json.loads(response)
 
-def trigger_n8n_contact(
-    restaurant_id: int,
-    restaurant_name: str,
-    cuisine: str,
-    city: str,
-    email: str | None,
-    phone: str | None,
-    website: str | None,
-    message: str,
-    user_name: str,
-    user_query: str
-) -> dict:
-    """
-    Send restaurant contact data to the n8n webhook.
+    except json.JSONDecodeError:
+        raise ValueError(
+            "LLM returned invalid JSON response"
+        )
 
-    n8n receives this payload and routes to:
-      - Email    if restaurant has email
-      - WhatsApp if restaurant has phone (via WhatsApp Business API)
-      - Booking  if restaurant has website with booking
 
-    The routing logic lives entirely in n8n — we just send the full
-    payload and let n8n decide.
-
-    Args:
-        All restaurant contact fields + the approved message + user info.
-
-    Returns:
-        Dict with status and n8n response.
-    """
-    n8n_webhook_url = os.environ.get("N8N_WEBHOOK_URL", "")
-
-    if not n8n_webhook_url:
-        return {
-            "success": False,
-            "error": "N8N_WEBHOOK_URL not set in environment variables."
-        }
-
-    # Determine available contact methods for n8n routing
-    contact_methods = []
-    if email:
-        contact_methods.append("email")
-    if phone:
-        contact_methods.append("whatsapp")
-    if website:
-        contact_methods.append("booking")
-
-    payload = {
-        "restaurant": {
-            "id":      restaurant_id,
-            "name":    restaurant_name,
-            "cuisine": cuisine,
-            "city":    city,
-            "email":   email,
-            "phone":   phone,
-            "website": website,
-        },
-        "contact_methods": contact_methods,   # n8n uses this for routing
-        "message":         message,
-        "user": {
-            "name":  user_name,
-            "query": user_query,
-        },
+    return {
+        "email_message": messages["email_message"],
+        "whatsapp_message": messages["whatsapp_message"]
     }
 
-    try:
-        response = httpx.post(
-            n8n_webhook_url,
-            json=payload,
-            timeout=10.0,
-            headers={"Content-Type": "application/json"}
-        )
-        response.raise_for_status()
 
-        return {
-            "success":         True,
-            "contact_methods": contact_methods,
-            "n8n_status":      response.status_code,
-            "message":         f"Contact request sent via {', '.join(contact_methods) or 'no channel available'}."
-        }
 
-    except httpx.HTTPStatusError as e:
+
+async def generate_whatsapp_url(
+    db: AsyncSession,
+    restaurant: Restaurant,
+    message: str,
+) -> dict:
+
+    if not restaurant.phone:
         return {
             "success": False,
-            "error":   f"n8n webhook returned {e.response.status_code}: {e.response.text}"
+            "error": "Restaurant has no WhatsApp/phone number."
         }
-    except Exception as e:
-        return {
-            "success": False,
-            "error":   str(e)
-        }
+
+    phone = "".join(filter(str.isdigit, restaurant.phone))
+
+    if phone.startswith("0"):
+        phone = "92" + phone[1:]
+
+    whatsapp_url = (
+        f"https://wa.me/{phone}"
+        f"?text={quote(message)}"
+    )
+
+    return {
+        "success": True,
+        "channel": "whatsapp",
+        "action": "manual",
+        "restaurant_id": restaurant.id,
+        "restaurant_name": restaurant.name,
+        "whatsapp_url": whatsapp_url,
+    }
+
+
+def generate_gmail_compose_url(
+    recipient_email: str,
+    message: str,
+    subject: str = "Reservation Request"
+) -> str:
+    """
+    Generate Gmail compose URL.
+
+    User clicks this URL:
+    - Gmail opens
+    - Recipient is filled
+    - Subject is filled
+    - Message is filled
+    """
+
+    params = {
+        "view": "cm",
+        "fs": "1",
+        "to": recipient_email,
+        "su": subject,
+        "body": message
+    }
+
+    return (
+        "https://mail.google.com/mail/?"
+        + urlencode(params)
+    )
+
+# ── n8n webhook caller ─────────────────────────────────────────────────────
+
+# def trigger_n8n_contact(
+#     restaurant_id: int,
+#     restaurant_name: str,
+#     cuisine: str,
+#     city: str,
+#     email: str | None,
+#     phone: str | None,
+#     website: str | None,
+#     message: str,
+#     user_name: str,
+#     user_query: str
+# ) -> dict:
+#     """
+#     Send restaurant contact data to the n8n webhook.
+
+#     n8n receives this payload and routes to:
+#       - Email    if restaurant has email
+#       - WhatsApp if restaurant has phone (via WhatsApp Business API)
+#       - Booking  if restaurant has website with booking
+
+#     The routing logic lives entirely in n8n — we just send the full
+#     payload and let n8n decide.
+
+#     Args:
+#         All restaurant contact fields + the approved message + user info.
+
+#     Returns:
+#         Dict with status and n8n response.
+#     """
+#     n8n_webhook_url = os.environ.get("N8N_WEBHOOK_URL", "")
+
+#     if not n8n_webhook_url:
+#         return {
+#             "success": False,
+#             "error": "N8N_WEBHOOK_URL not set in environment variables."
+#         }
+
+#     # Determine available contact methods for n8n routing
+#     contact_methods = []
+#     if email:
+#         contact_methods.append("email")
+#     if phone:
+#         contact_methods.append("whatsapp")
+#     if website:
+#         contact_methods.append("booking")
+
+#     payload = {
+#         "restaurant": {
+#             "id":      restaurant_id,
+#             "name":    restaurant_name,
+#             "cuisine": cuisine,
+#             "city":    city,
+#             "email":   email,
+#             "phone":   phone,
+#             "website": website,
+#         },
+#         "contact_methods": contact_methods,   # n8n uses this for routing
+#         "message":         message,
+#         "user": {
+#             "name":  user_name,
+#             "query": user_query,
+#         },
+#     }
+
+#     try:
+#         response = httpx.post(
+#             n8n_webhook_url,
+#             json=payload,
+#             timeout=10.0,
+#             headers={"Content-Type": "application/json"}
+#         )
+#         response.raise_for_status()
+
+#         return {
+#             "success":         True,
+#             "contact_methods": contact_methods,
+#             "n8n_status":      response.status_code,
+#             "message":         f"Contact request sent via {', '.join(contact_methods) or 'no channel available'}."
+#         }
+
+#     except httpx.HTTPStatusError as e:
+#         return {
+#             "success": False,
+#             "error":   f"n8n webhook returned {e.response.status_code}: {e.response.text}"
+#         }
+#     except Exception as e:
+#         return {
+#             "success": False,
+#             "error":   str(e)
+#         }
 
 
 
@@ -233,6 +346,26 @@ def _get_apify_token() -> str:
     return token
 
 
+# ── Internal helper ────────────────────────────────────────────────────────
+
+async def _get_restaurant_contact_method(restaurant_id: int) -> dict:
+    """
+    Look up a restaurant's available contact channels and return
+    the best one for the draft message tone.
+    """
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Restaurant).where(Restaurant.id == restaurant_id)
+        )
+        r = result.scalars().first()
+
+    return {
+        "email" : r.get("email",None),
+        "phone" : r.get("phone",None),
+        "website":r.get("website",None),
+    }
+
+
 # ── Apify API call ──────────────────────────────────────────────────────────
 
 async def _run_apify_scraper_resilient(
@@ -241,7 +374,7 @@ async def _run_apify_scraper_resilient(
 ) -> tuple[list[dict], dict]:
     """
     Start an Apify run, poll it, and fetch dataset items no matter how
-    the run ends. This is the core fix for credit-exhaustion data loss.
+    the run ends. 
 
     Returns:
         (raw_places, run_info)
@@ -316,10 +449,6 @@ async def _run_apify_scraper_resilient(
 
         is_partial = final_status != "SUCCEEDED"
 
-        # Step 3: fetch dataset items REGARDLESS of final status.
-        # This is the key line — even if credits ran out and status is
-        # FAILED or ABORTED, whatever Apify already scraped is still
-        # sitting in this dataset and we can retrieve it.
         try:
             items_resp = await client.get(
                 APIFY_DATASET_ITEMS_URL.format(dataset_id=dataset_id),

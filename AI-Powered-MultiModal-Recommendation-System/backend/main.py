@@ -54,14 +54,10 @@ from backend import analytics as analytics_module
 from backend.agents.workflow import run_recommendation_workflow
 from backend.memory import session as session_memory
 
-from pydantic import BaseModel, Field
-
 from backend.model.schemas import (
     RestaurantRequest, FeedbackRequest,RestaurantDetail,
     RecommendRequest, HealthResponse, SyncResponse,
     SearchResult, SearchResponse, ReviewOut,
-    GenerateMessageRequest, ContactRequest
-    
 )
 
 app = FastAPI(
@@ -73,7 +69,7 @@ app = FastAPI(
 )
 
 # n8n-triggered fully automated Apify sync (no manual export/import)
-from n8n.api.routers import router as apify_automation_router
+from contact_method.routers import contact_router as apify_automation_router
 app.include_router(apify_automation_router)
 
 
@@ -552,107 +548,6 @@ def vector_stats():
         "active_sessions": session_memory.active_sessions()
     }
 
-
-
-
-@app.post("/generate-message")
-async def generate_message(request: GenerateMessageRequest):
-    """
-    Generate a draft contact message from the user to a restaurant.
-
-    Called when the user clicks 'Select' on a restaurant card.
-    Returns a draft message the user can approve or edit before sending.
-
-    The message tone adapts to the contact channel:
-      email    → formal
-      whatsapp → casual and brief
-      booking  → concise reservation request
-    """
-    from n8n.backend.contact import generate_contact_message
-
-    # Determine best contact method based on what restaurant has
-    result = await _get_restaurant_contact_method(request.restaurant_id)
-    contact_method = result.get("method", request.contact_method)
-
-    draft = generate_contact_message(
-        restaurant_name=request.restaurant_name,
-        cuisine=request.cuisine,
-        city=request.city,
-        user_name=request.user_name,
-        user_query=request.user_query,
-        contact_method=contact_method
-    )
-
-    return {
-        "draft_message":   draft,
-        "contact_method":  contact_method,
-        "restaurant_name": request.restaurant_name
-    }
-
-
-@app.post("/contact-restaurant")
-async def contact_restaurant(
-    request: ContactRequest,
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Send the approved message to the restaurant via n8n.
-
-    n8n receives the full payload and routes to:
-      - Email    if restaurant.email is set
-      - WhatsApp if restaurant.phone is set
-      - Booking  if restaurant.website is set
-
-    The routing logic lives in n8n — this endpoint just fires the webhook.
-    """
-    from n8n.backend.contact import trigger_n8n_contact
-
-    result = trigger_n8n_contact(
-        restaurant_id=request.restaurant_id,
-        restaurant_name=request.restaurant_name,
-        cuisine=request.cuisine,
-        city=request.city,
-        email=request.email,
-        phone=request.phone,
-        website=request.website,
-        message=request.message,
-        user_name=request.user_name,
-        user_query=request.user_query
-    )
-
-    if not result["success"]:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=result.get("error", "n8n webhook failed.")
-        )
-
-    return result
-
-
-# ── Internal helper ────────────────────────────────────────────────────────
-
-async def _get_restaurant_contact_method(restaurant_id: int) -> dict:
-    """
-    Look up a restaurant's available contact channels and return
-    the best one for the draft message tone.
-    """
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(Restaurant).where(Restaurant.id == restaurant_id)
-        )
-        r = result.scalars().first()
-
-    if not r:
-        return {"method": "email"}
-
-    if r.email:
-        return {"method": "email",    "value": r.email}
-    if r.phone:
-        return {"method": "whatsapp", "value": r.phone}
-    if r.website:
-        return {"method": "booking",  "value": r.website}
-
-    return {"method": "email"}
 
 
 # ── Review summarisation endpoint ──────────────────────────────────────────

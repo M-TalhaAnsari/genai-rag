@@ -3,40 +3,12 @@ backend/apify_loader.py
 ------------------------
 Loads Apify Google Maps Scraper data into PostgreSQL + ChromaDB + BM25.
 
-Used by both:
-  - Manual load: POST /load-apify (reads data/apify_export.json)
-  - Automated:   backend/apify_automation.py (calls Apify API directly)
-
-FIELD MAPPING — VERIFIED AGAINST REAL APIFY OUTPUT
-------------------------------------------------------
-The actor returns city/neighborhood/postalCode/state as SEPARATE
-TOP-LEVEL fields, NOT nested inside "address" (address is a plain string).
-Earlier versions of this loader assumed address was a dict — that bug
-caused every restaurant to get city="Pakistan".
-
-Correct top-level fields used here:
-  title, categoryName, categories (list), address (string),
-  neighborhood, city, postalCode, state, countryCode,
-  website, phone, phoneUnformatted, location {lat, lng}, menu,
-  totalScore, reviewsCount, price, placeId, permanentlyClosed,
-  openingHours, additionalInfo, reviewsDistribution, reviewsTags,
-  imageUrl, imageUrls, reviews, description
-
-DEDUPLICATION
---------------
-Uses placeId (Google's unique per-location ID) as the primary key.
-This correctly handles:
-  - Chain branches with the same name in different areas (kept separate)
-  - Re-running a sync (same placeId = same restaurant = skipped)
-Falls back to (name, city) only when placeId is missing.
 """
 
 import json
 import os
-from pathlib import Path
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.db.database import AsyncSessionLocal, engine, Base
 from backend.model.models import Restaurant, Review
@@ -63,8 +35,7 @@ def _extract_price_level(price_raw) -> str | None:
 
 def _extract_all_cuisines(place: dict) -> list[str]:
     """
-    Extract ALL cuisine categories, not just the primary one.
-    Google Maps often tags a restaurant with 3-5 categories
+    Extract ALL cuisine categories
     (e.g. "Steak house", "Chinese restaurant", "Seafood restaurant").
     """
     categories = place.get("categories") or []
@@ -91,8 +62,6 @@ def _extract_tags_from_additional_info(place: dict) -> list[str]:
     additionalInfo structure:
       {"Atmosphere": [{"Cozy": true}, {"Romantic": true}], "Highlights": [...], ...}
 
-    We prioritise categories that describe VIBE and EXPERIENCE
-    (most useful for embedding/search) over logistics (parking, payments).
     """
     additional = place.get("additionalInfo") or {}
     if not isinstance(additional, dict):
@@ -120,8 +89,7 @@ def _extract_tags_from_additional_info(place: dict) -> list[str]:
 def _extract_top_dishes(place: dict) -> list[str]:
     """
     Extract frequently-mentioned dish names from reviewsTags.
-    e.g. [{"title": "tomahawk steak", "count": 2}, ...]
-    Sorted by mention count — most-talked-about dishes first.
+  
     """
     review_tags = place.get("reviewsTags") or []
     if not review_tags:
@@ -195,7 +163,6 @@ def normalize_apify_place(place: dict) -> tuple[dict, list[dict]]:
       - restaurant_data dict (matches Restaurant model fields)
       - reviews list of dicts (matches Review model fields)
 
-    All field access uses TOP-LEVEL keys verified against real Apify output.
     """
     name = (place.get("title") or "").strip()
     city = (place.get("city") or "").strip()
@@ -259,8 +226,6 @@ async def load_apify_export(filepath: str = APIFY_EXPORT_PATH) -> dict:
     Read the Apify JSON export and load all records into:
       PostgreSQL (Restaurant + Review rows) → ChromaDB → BM25 index.
 
-    Deduplicates by external_id (placeId) — falls back to (name, city)
-    only when placeId is missing.
     """
     if not os.path.exists(filepath):
         return {
@@ -294,11 +259,6 @@ async def _load_places(raw_data: list[dict]) -> dict:
                 skipped += 1
                 continue
 
-            # HARD country filter — reject anything not verified as Pakistan.
-            # Apify's location-string search can match business names
-            # containing Pakistani-sounding words anywhere in the world
-            # (e.g. "Karachi Food Company" in Texas). countryCode is the
-            # one field Google Maps reliably sets per place.
             country_code = place.get("countryCode")
             if country_code and country_code != "PK":
                 skipped_wrong_country += 1
