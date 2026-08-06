@@ -1,37 +1,38 @@
 """
 backend/apify_loader.py
 ------------------------
-Loads a one-time Apify Google Maps Scraper export into PostgreSQL + ChromaDB + BM25.
+Loads Apify Google Maps Scraper data into PostgreSQL + ChromaDB + BM25.
 
-HOW TO GET YOUR APIFY DATA
----------------------------
-1. Go to https://apify.com and sign up (free — $5/month credits, no card needed)
-2. Open: https://apify.com/compass/crawler-google-places
-3. Click "Try for free"
-4. Set search terms (one per city):
-     "restaurants in Lahore Pakistan"
-     "restaurants in Islamabad Pakistan"
-     "restaurants in Karachi Pakistan"
-     "restaurants in Rawalpindi Pakistan"
-5. Set maxCrawledPlacesPerSearch = 50 (200 total, fits in free $5 credits)
-6. Run the actor
-7. When done: Dataset → Export → JSON
-8. Save the file as: data/apify_export.json
-9. Run: python -m backend.apify_loader
+Used by both:
+  - Manual load: POST /load-apify (reads data/apify_export.json)
+  - Automated:   backend/apify_automation.py (calls Apify API directly)
 
-The $5 free credit covers this one-time scrape (~200-500 restaurants).
-After that, OSM + Foursquare handle weekly incremental updates.
+FIELD MAPPING — VERIFIED AGAINST REAL APIFY OUTPUT
+------------------------------------------------------
+The actor returns city/neighborhood/postalCode/state as SEPARATE
+TOP-LEVEL fields, NOT nested inside "address" (address is a plain string).
+Earlier versions of this loader assumed address was a dict — that bug
+caused every restaurant to get city="Pakistan".
 
-WHAT APIFY PROVIDES PER RESTAURANT
-------------------------------------
-name, address, phone, website, rating, reviewCount, priceLevel,
-totalScore, categories, openingHours, imageUrls, description,
-latitude, longitude, reviews (up to 5 per place), url, placeId
+Correct top-level fields used here:
+  title, categoryName, categories (list), address (string),
+  neighborhood, city, postalCode, state, countryCode,
+  website, phone, phoneUnformatted, location {lat, lng}, menu,
+  totalScore, reviewsCount, price, placeId, permanentlyClosed,
+  openingHours, additionalInfo, reviewsDistribution, reviewsTags,
+  imageUrl, imageUrls, reviews, description
+
+DEDUPLICATION
+--------------
+Uses placeId (Google's unique per-location ID) as the primary key.
+This correctly handles:
+  - Chain branches with the same name in different areas (kept separate)
+  - Re-running a sync (same placeId = same restaurant = skipped)
+Falls back to (name, city) only when placeId is missing.
 """
 
 import json
 import os
-import asyncio
 from pathlib import Path
 
 from sqlalchemy import select
@@ -44,113 +45,200 @@ from backend.retrieving import vector_store, bm25_store
 APIFY_EXPORT_PATH = "data/apify_export.json"
 
 
-def _extract_city(place: dict) -> str:
-    """
-    Extract city from Apify address fields.
-    Apify returns address as a dict with city, state, country fields.
-    """
-    addr = place.get("address", {})
-    if isinstance(addr, dict):
-        return (
-            addr.get("city")
-            or addr.get("neighborhood")
-            or addr.get("state")
-            or "Pakistan"
-        ).strip()
-    # Sometimes address is a plain string
-    return "Pakistan"
+# ── Field extraction helpers ────────────────────────────────────────────────
 
-
-def _extract_cuisine(place: dict) -> str:
-    """Extract primary cuisine from Apify categories list."""
-    categories = place.get("categories", [])
-    if not categories:
-        return "Restaurant"
-    # Filter out generic terms
-    skip = {"restaurant", "food", "establishment", "point_of_interest"}
-    for cat in categories:
-        if isinstance(cat, str) and cat.lower() not in skip:
-            return cat.title()
-    return categories[0].title() if categories else "Restaurant"
-
-
-def _extract_price_level(place: dict) -> str | None:
-    """Convert Apify priceLevel integer (1-4) to $ symbols."""
-    level = place.get("priceLevel") or place.get("price")
-    if isinstance(level, int):
-        return "$" * max(1, min(4, level))
-    if isinstance(level, str) and level.startswith("$"):
-        return level
+def _extract_price_level(price_raw) -> str | None:
+    """Convert Apify price field to $ symbols. Handles int, string, or None."""
+    if price_raw is None:
+        return None
+    if isinstance(price_raw, int):
+        return "$" * max(1, min(4, price_raw))
+    if isinstance(price_raw, str):
+        if price_raw.startswith("$"):
+            return price_raw
+        # Apify sometimes returns "Rs 500–1000" style — keep as-is, capped
+        return price_raw[:20]
     return None
 
 
+def _extract_all_cuisines(place: dict) -> list[str]:
+    """
+    Extract ALL cuisine categories, not just the primary one.
+    Google Maps often tags a restaurant with 3-5 categories
+    (e.g. "Steak house", "Chinese restaurant", "Seafood restaurant").
+    """
+    categories = place.get("categories") or []
+    if not categories:
+        primary = place.get("categoryName")
+        return [primary] if primary else []
+
+    cleaned = []
+    seen = set()
+    for c in categories:
+        if not isinstance(c, str):
+            continue
+        c_clean = c.strip()
+        key = c_clean.lower()
+        if c_clean and key not in seen:
+            seen.add(key)
+            cleaned.append(c_clean)
+    return cleaned[:6]   # cap — a restaurant tagged with 10+ categories is noise
+
+
+def _extract_tags_from_additional_info(place: dict) -> list[str]:
+    """
+    Flatten additionalInfo into a list of feature tags.
+    additionalInfo structure:
+      {"Atmosphere": [{"Cozy": true}, {"Romantic": true}], "Highlights": [...], ...}
+
+    We prioritise categories that describe VIBE and EXPERIENCE
+    (most useful for embedding/search) over logistics (parking, payments).
+    """
+    additional = place.get("additionalInfo") or {}
+    if not isinstance(additional, dict):
+        return []
+
+    priority_categories = [
+        "Atmosphere", "Highlights", "Offerings",
+        "Dining options", "Crowd", "Popular for", "Service options"
+    ]
+
+    tags = []
+    for category in priority_categories:
+        items = additional.get(category, [])
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict):
+                for feature, is_true in item.items():
+                    if is_true and feature not in tags:
+                        tags.append(feature)
+
+    return tags[:20]   # cap for token safety downstream
+
+
+def _extract_top_dishes(place: dict) -> list[str]:
+    """
+    Extract frequently-mentioned dish names from reviewsTags.
+    e.g. [{"title": "tomahawk steak", "count": 2}, ...]
+    Sorted by mention count — most-talked-about dishes first.
+    """
+    review_tags = place.get("reviewsTags") or []
+    if not review_tags:
+        return []
+
+    sorted_tags = sorted(
+        [t for t in review_tags if isinstance(t, dict) and t.get("count", 0) >= 2],
+        key=lambda t: t.get("count", 0),
+        reverse=True
+    )
+    return [t["title"] for t in sorted_tags[:8] if t.get("title")]
+
+
 def _extract_hours(place: dict) -> str | None:
-    """Serialize opening hours to JSON string."""
-    hours = place.get("openingHours") or place.get("popularTimesHistogram")
+    """Serialize openingHours list to JSON string."""
+    hours = place.get("openingHours")
     if not hours:
         return None
-    if isinstance(hours, (dict, list)):
-        return json.dumps(hours)
-    return str(hours)
+    return json.dumps(hours)
 
 
 def _extract_photos(place: dict) -> str | None:
-    """Serialize photo URLs to JSON string."""
-    images = place.get("imageUrls") or place.get("images") or []
-    if not images:
+    """Combine main imageUrl + imageUrls list, capped."""
+    urls = []
+    main_image = place.get("imageUrl")
+    if main_image:
+        urls.append(main_image)
+    extra = place.get("imageUrls") or []
+    if isinstance(extra, list):
+        urls.extend(extra[:9])
+    return json.dumps(urls[:10]) if urls else None
+
+
+def _extract_reviews_distribution(place: dict) -> str | None:
+    """Serialize the full star-rating breakdown — used for fake review detection."""
+    dist = place.get("reviewsDistribution")
+    if not dist or not isinstance(dist, dict):
         return None
-    # Keep max 10 photos to avoid huge DB rows
-    return json.dumps(images[:10])
+    return json.dumps({
+        "one_star":   dist.get("oneStar", 0),
+        "two_star":   dist.get("twoStar", 0),
+        "three_star": dist.get("threeStar", 0),
+        "four_star":  dist.get("fourStar", 0),
+        "five_star":  dist.get("fiveStar", 0),
+    })
 
 
-def _extract_tags(place: dict) -> str | None:
-    """Build a tags list from Apify amenities and highlights."""
-    tags = []
-    for key in ("amenities", "highlights", "serviceOptions"):
-        val = place.get(key)
-        if isinstance(val, dict):
-            tags.extend(k for k, v in val.items() if v is True)
-        elif isinstance(val, list):
-            tags.extend(val)
-    return json.dumps(tags) if tags else None
+def _build_description(place: dict, top_dishes: list[str], all_cuisines: list[str]) -> str | None:
+    """
+    Apify's 'description' field is almost always null for Google Maps places.
+    Build a useful description from categories + top-mentioned dishes instead.
+    """
+    raw_desc = place.get("description")
+    if raw_desc and len(raw_desc.strip()) > 10:
+        return raw_desc.strip()[:400]
 
+    parts = []
+    if all_cuisines:
+        parts.append(f"Serves {', '.join(all_cuisines[:3])}.")
+    if top_dishes:
+        parts.append(f"Known for: {', '.join(top_dishes[:5])}.")
+
+    return " ".join(parts) if parts else None
+
+
+# ── Main normalisation function ─────────────────────────────────────────────
 
 def normalize_apify_place(place: dict) -> tuple[dict, list[dict]]:
     """
     Convert one raw Apify Google Maps place into:
       - restaurant_data dict (matches Restaurant model fields)
       - reviews list of dicts (matches Review model fields)
+
+    All field access uses TOP-LEVEL keys verified against real Apify output.
     """
-    city = _extract_city(place)
+    name = (place.get("title") or "").strip()
+    city = (place.get("city") or "").strip()
+    area = (place.get("neighborhood") or "").strip() or None
+
+    all_cuisines = _extract_all_cuisines(place)
+    primary_cuisine = all_cuisines[0] if all_cuisines else (place.get("categoryName") or "Restaurant")
+
+    top_dishes = _extract_top_dishes(place)
+    tags = _extract_tags_from_additional_info(place)
+    combined_tags = list(dict.fromkeys(tags + top_dishes))   # merge, dedupe, keep order
+
+    location = place.get("location") or {}
 
     restaurant_data = {
-        "name":          (place.get("title") or place.get("name") or "").strip(),
-        "cuisine":       _extract_cuisine(place),
+        "name":          name,
+        "cuisine":       primary_cuisine,
+        "all_cuisines":  json.dumps(all_cuisines) if all_cuisines else None,
         "city":          city,
-        "address":       place.get("address") if isinstance(place.get("address"), str)
-                         else place.get("street") or place.get("addressStreet"),
+        "area":          area,
+        "postal_code":   place.get("postalCode"),
+        "address":       place.get("address"),
         "phone":         place.get("phone") or place.get("phoneUnformatted"),
         "website":       place.get("website"),
-        "menu_url":      place.get("menuUrl"),
-        "latitude":      place.get("location", {}).get("lat") if isinstance(place.get("location"), dict)
-                         else place.get("lat"),
-        "longitude":     place.get("location", {}).get("lng") if isinstance(place.get("location"), dict)
-                         else place.get("lng"),
-        "rating":        place.get("totalScore") or place.get("rating"),
-        "review_count":  place.get("reviewsCount") or place.get("reviewCount"),
-        "price_level":   _extract_price_level(place),
-        "description":   place.get("description"),
+        "menu_url":      place.get("menu"),              # NOTE: field is "menu" not "menuUrl"
+        "latitude":      location.get("lat"),
+        "longitude":     location.get("lng"),
+        "rating":        place.get("totalScore"),
+        "review_count":  place.get("reviewsCount"),
+        "price_level":   _extract_price_level(place.get("price")),
+        "description":   _build_description(place, top_dishes, all_cuisines),
         "opening_hours": _extract_hours(place),
         "photos":        _extract_photos(place),
-        "tags":          _extract_tags(place),
+        "tags":          json.dumps(combined_tags) if combined_tags else None,
+        "reviews_distribution": _extract_reviews_distribution(place),
         "source":        "apify",
-        "external_id":   place.get("placeId") or place.get("id"),
+        "external_id":   place.get("placeId"),
     }
 
-    # Extract up to 5 reviews per place
+    # Reviews — only present if actor input requested them (maxReviews > 0)
     raw_reviews = place.get("reviews") or []
     reviews = []
-    for r in raw_reviews[:5]:
+    for r in raw_reviews[:10]:
         if not isinstance(r, dict):
             continue
         reviews.append({
@@ -164,14 +252,15 @@ def normalize_apify_place(place: dict) -> tuple[dict, list[dict]]:
     return restaurant_data, reviews
 
 
+# ── Load pipeline ────────────────────────────────────────────────────────────
+
 async def load_apify_export(filepath: str = APIFY_EXPORT_PATH) -> dict:
     """
     Read the Apify JSON export and load all records into:
-      - PostgreSQL (Restaurant + Review rows)
-      - ChromaDB (embeddings for new restaurants)
-      - BM25 index (rebuilt after all inserts)
+      PostgreSQL (Restaurant + Review rows) → ChromaDB → BM25 index.
 
-    Returns a summary dict.
+    Deduplicates by external_id (placeId) — falls back to (name, city)
+    only when placeId is missing.
     """
     if not os.path.exists(filepath):
         return {
@@ -185,41 +274,63 @@ async def load_apify_export(filepath: str = APIFY_EXPORT_PATH) -> dict:
     if not isinstance(raw_data, list):
         return {"error": "Expected a JSON array at the top level of the Apify export."}
 
-    print(f"[apify] Loaded {len(raw_data)} places from {filepath}")
+    return await _load_places(raw_data)
 
-    inserted = 0
-    skipped = 0
-    reviews_inserted = 0
-    embedded = 0
+
+async def _load_places(raw_data: list[dict]) -> dict:
+    """Shared loading logic — used by both manual file load and automated API load."""
+    print(f"[apify] Processing {len(raw_data)} places")
+
+    inserted, skipped, reviews_inserted, embedded = 0, 0, 0, 0
+    skipped_wrong_country = 0
     errors = []
 
     async with AsyncSessionLocal() as db:
-        newly_inserted: list[Restaurant] = []
+        newly_inserted: list[tuple[Restaurant, list[dict]]] = []
 
         for place in raw_data:
+            # Skip closed places defensively (actor input should already filter these)
+            if place.get("permanentlyClosed") or place.get("temporarilyClosed"):
+                skipped += 1
+                continue
+
+            # HARD country filter — reject anything not verified as Pakistan.
+            # Apify's location-string search can match business names
+            # containing Pakistani-sounding words anywhere in the world
+            # (e.g. "Karachi Food Company" in Texas). countryCode is the
+            # one field Google Maps reliably sets per place.
+            country_code = place.get("countryCode")
+            if country_code and country_code != "PK":
+                skipped_wrong_country += 1
+                continue
+
             try:
                 restaurant_data, reviews = normalize_apify_place(place)
             except Exception as e:
-                errors.append(str(e))
+                errors.append(f"normalise error: {e}")
                 continue
 
             name = restaurant_data.get("name", "").strip()
-            city = restaurant_data.get("city", "").strip()
+            external_id = restaurant_data.get("external_id")
 
             if not name:
                 skipped += 1
                 continue
 
-            # Deduplicate by name + city
-            result = await db.execute(
-                select(Restaurant).where(
-                    Restaurant.name == name,
-                    Restaurant.city == city
+            # Dedup by placeId first (correct for chain branches), name+city fallback
+            if external_id:
+                result = await db.execute(
+                    select(Restaurant).where(Restaurant.external_id == external_id)
                 )
-            )
-            existing = result.scalars().first()
+            else:
+                result = await db.execute(
+                    select(Restaurant).where(
+                        Restaurant.name == name,
+                        Restaurant.city == restaurant_data.get("city", "")
+                    )
+                )
 
-            if existing:
+            if result.scalars().first():
                 skipped += 1
                 continue
 
@@ -230,22 +341,29 @@ async def load_apify_export(filepath: str = APIFY_EXPORT_PATH) -> dict:
 
         await db.commit()
 
-        # Refresh to get auto-assigned IDs, then insert reviews + embed
+        # Refresh, insert reviews, embed
         for record, reviews in newly_inserted:
             await db.refresh(record)
 
-            # Insert reviews
             for rv in reviews:
                 db.add(Review(restaurant_id=record.id, **rv))
                 reviews_inserted += 1
 
-            # Embed into ChromaDB
             try:
                 vector_store.upsert_restaurant(
                     restaurant_id=record.id,
                     name=record.name,
                     cuisine=record.cuisine,
-                    city=record.city
+                    city=record.city,
+                    address=record.address,
+                    description=record.description,
+                    tags=record.tags,
+                    opening_hours=record.opening_hours,
+                    phone=record.phone,
+                    website=record.website,
+                    rating=record.rating,
+                    latitude=record.latitude,
+                    longitude=record.longitude,
                 )
                 record.is_embedded = True
                 embedded += 1
@@ -262,17 +380,12 @@ async def load_apify_export(filepath: str = APIFY_EXPORT_PATH) -> dict:
             for r in all_restaurants
         ])
 
-    print(f"[apify] Done: {inserted} inserted, {skipped} skipped, "
-          f"{reviews_inserted} reviews, {embedded} embedded")
+        # Auto-summarise reviews for newly inserted restaurants that have them
+        summarised = 0
+        if newly_inserted:
+            from backend.data_loader.review_summariser import summarise_reviews
+            from backend.retrieving.vector_store import upsert_review_summary
 
-    # Auto-trigger review summarisation for all newly inserted restaurants
-    # that have reviews — this populates the ChromaDB review_summaries collection
-    summarised = 0
-    if newly_inserted:
-        from backend.data_loader.review_summariser import summarise_reviews
-        from backend.retrieving.vector_store import upsert_review_summary
-
-        async with AsyncSessionLocal() as db:
             for record, reviews in newly_inserted:
                 if not reviews:
                     continue
@@ -293,15 +406,18 @@ async def load_apify_export(filepath: str = APIFY_EXPORT_PATH) -> dict:
                 except Exception as e:
                     errors.append(f"summarise {record.name}: {e}")
 
-    print(f"[apify] Review summaries generated: {summarised}")
+    print(f"[apify] Done: {inserted} inserted, {skipped} skipped, "
+          f"{skipped_wrong_country} wrong-country rejected, "
+          f"{reviews_inserted} reviews, {embedded} embedded, {summarised} summarised")
 
     return {
-        "inserted":           inserted,
-        "skipped":            skipped,
-        "reviews_inserted":   reviews_inserted,
-        "embedded":           embedded,
-        "reviews_summarised": summarised,
-        "errors":             errors[:10],
+        "inserted":               inserted,
+        "skipped":                skipped,
+        "skipped_wrong_country":  skipped_wrong_country,
+        "reviews_inserted":       reviews_inserted,
+        "embedded":               embedded,
+        "reviews_summarised":     summarised,
+        "errors":                 errors[:10],
     }
 
 
@@ -311,10 +427,8 @@ if __name__ == "__main__":
     import asyncio
 
     async def main():
-        # Ensure tables exist
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-
         result = await load_apify_export()
         print(json.dumps(result, indent=2))
 

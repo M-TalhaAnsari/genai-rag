@@ -34,20 +34,25 @@ class Restaurant(Base):
     # Contact
     address       = Column(String, nullable=True)
     phone         = Column(String, nullable=True)
+    email         = Column(String, nullable=True)
     website       = Column(String, nullable=True)
     menu_url      = Column(String, nullable=True)
 
     # Location
     latitude      = Column(Float, nullable=True)
     longitude     = Column(Float, nullable=True)
+    area          = Column(String, nullable=True)      # neighborhood/sector, e.g. "F 6/1 Blue Area"
+    postal_code   = Column(String, nullable=True)
 
     # Quality signals
     rating        = Column(Float, nullable=True)       # 0.0 – 5.0
     review_count  = Column(Integer, nullable=True)
     price_level   = Column(String, nullable=True)      # "$" | "$$" | "$$$" | "$$$$"
+    reviews_distribution = Column(Text, nullable=True) # JSON: {"oneStar":.., "fiveStar":..}
 
     # Rich content (stored as JSON strings)
     description   = Column(Text, nullable=True)
+    all_cuisines  = Column(Text, nullable=True)         # JSON list — a place can serve multiple cuisines
     opening_hours = Column(Text, nullable=True)        # JSON: {"Monday": "9am-10pm", ...}
     photos        = Column(Text, nullable=True)        # JSON: ["url1", "url2", ...]
     tags          = Column(Text, nullable=True)        # JSON: ["rooftop", "family-friendly"]

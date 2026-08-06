@@ -20,23 +20,28 @@ from langchain_groq import ChatGroq
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage
 
-from fastapi import APIRouter, HTTPException, status
-from sqlalchemy import select
+from fastapi import HTTPException, status
 
 from backend.db.database import AsyncSessionLocal
-from backend.model.models import Restaurant, Review
-from backend.retrieving import vector_store, bm25_store
-from backend.data_loader.apify_loader import normalize_apify_place   # reuse existing logic
+
 
 load_dotenv()
 
 
-APIFY_ACTOR_ID = "compass~crawler-google-places"   # Google Maps scraper
-APIFY_RUN_SYNC_URL = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/run-sync-get-dataset-items"
+APIFY_ACTOR_ID = "compass~crawler-google-places"
 
-DEFAULT_CITIES = ["Lahore", "Islamabad", "Karachi", "Rawalpindi"]
-DEFAULT_PER_CITY_LIMIT = 50
+APIFY_START_RUN_URL     = f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}/runs"
+APIFY_RUN_STATUS_URL    = "https://api.apify.com/v2/actor-runs/{run_id}"
+APIFY_DATASET_ITEMS_URL = "https://api.apify.com/v2/datasets/{dataset_id}/items"
 
+
+TARGET_COUNTRY_CODE = "PK"
+
+# Polling config
+POLL_INTERVAL_SECONDS = 10
+MAX_POLL_ATTEMPTS = 60   # 60 × 10s = 10 min max wait
+
+TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
 
 # ── LLM setup ──────────────────────────────────────────────────────────────
 
@@ -230,48 +235,113 @@ def _get_apify_token() -> str:
 
 # ── Apify API call ──────────────────────────────────────────────────────────
 
-async def _run_apify_scraper(cities: list[str], per_city_limit: int) -> list[dict]:
+async def _run_apify_scraper_resilient(
+    cities: list[str],
+    per_city_limit: int
+) -> tuple[list[dict], dict]:
     """
-    Trigger the Apify Google Maps scraper actor synchronously and
-    return the raw scraped places.
+    Start an Apify run, poll it, and fetch dataset items no matter how
+    the run ends. This is the core fix for credit-exhaustion data loss.
 
-    Uses run-sync-get-dataset-items — this blocks until the actor
-    finishes and returns results directly, no polling required.
-    Can take 1-5 minutes depending on how many cities/results requested.
+    Returns:
+        (raw_places, run_info)
+        raw_places: list of scraped place dicts (may be partial if the
+                    run didn't finish — that's fine, we still use them)
+        run_info:   {"status": str, "is_partial": bool, "message": str}
     """
     token = _get_apify_token()
-
     search_terms = [f"restaurants in {city} Pakistan" for city in cities]
 
     actor_input = {
-        "searchStringsArray": search_terms,
+        "searchStringsArray":        search_terms,
         "maxCrawledPlacesPerSearch": per_city_limit,
-        "language": "en",
-        "exportPlaceUrls": False,
-        "skipClosedPlaces": True,
+        "language":                  "en",
+        "countryCode":               TARGET_COUNTRY_CODE,   # restrict to Pakistan
+        "exportPlaceUrls":           False,
+        "skipClosedPlaces":          True,
     }
 
-    async with httpx.AsyncClient(timeout=600.0) as client:   # 10 min timeout — actor runs can be slow
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # Step 1: start the run — returns immediately, does not wait
         try:
-            response = await client.post(
-                APIFY_RUN_SYNC_URL,
+            start_resp = await client.post(
+                APIFY_START_RUN_URL,
                 params={"token": token},
                 json=actor_input,
             )
-            response.raise_for_status()
-            return response.json()   # list of raw place dicts
-
+            start_resp.raise_for_status()
         except httpx.HTTPStatusError as e:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Apify API error {e.response.status_code}: {e.response.text[:300]}"
+                detail=f"Apify failed to start run: {e.response.status_code} {e.response.text[:300]}"
             )
-        except httpx.TimeoutException:
+
+        run_data    = start_resp.json().get("data", {})
+        run_id      = run_data.get("id")
+        dataset_id  = run_data.get("defaultDatasetId")
+
+        if not run_id or not dataset_id:
             raise HTTPException(
-                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-                detail=(
-                    "Apify actor run timed out (10 min limit). "
-                    "Try reducing per_city_limit or number of cities."
-                )
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Apify run started but returned no run ID / dataset ID."
             )
+
+        print(f"[apify] Run started: {run_id} (dataset: {dataset_id})")
+
+        # Step 2: poll until terminal status or max attempts reached
+        final_status = "UNKNOWN"
+        status_message = ""
+
+        for attempt in range(MAX_POLL_ATTEMPTS):
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+            try:
+                status_resp = await client.get(
+                    APIFY_RUN_STATUS_URL.format(run_id=run_id),
+                    params={"token": token},
+                )
+                status_resp.raise_for_status()
+                status_data = status_resp.json().get("data", {})
+                final_status = status_data.get("status", "UNKNOWN")
+                status_message = status_data.get("statusMessage", "") or ""
+
+                print(f"[apify] Poll {attempt+1}/{MAX_POLL_ATTEMPTS}: {final_status}")
+
+                if final_status in TERMINAL_STATUSES:
+                    break
+
+            except Exception as e:
+                print(f"[apify] Poll error (continuing): {e}")
+                continue
+
+        is_partial = final_status != "SUCCEEDED"
+
+        # Step 3: fetch dataset items REGARDLESS of final status.
+        # This is the key line — even if credits ran out and status is
+        # FAILED or ABORTED, whatever Apify already scraped is still
+        # sitting in this dataset and we can retrieve it.
+        try:
+            items_resp = await client.get(
+                APIFY_DATASET_ITEMS_URL.format(dataset_id=dataset_id),
+                params={"token": token, "clean": "true"},
+                timeout=60.0
+            )
+            items_resp.raise_for_status()
+            raw_places = items_resp.json()
+        except Exception as e:
+            raw_places = []
+            status_message += f" | dataset fetch error: {e}"
+
+    run_info = {
+        "status":     final_status,
+        "is_partial": is_partial,
+        "message":    status_message or (
+            "Run did not complete normally — data may be incomplete, "
+            "but everything scraped before it stopped was recovered."
+            if is_partial else "Run completed successfully."
+        )
+    }
+
+    print(f"[apify] Recovered {len(raw_places)} places (partial={is_partial})")
+    return raw_places, run_info
 

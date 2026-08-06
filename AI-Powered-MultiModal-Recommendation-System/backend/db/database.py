@@ -13,7 +13,9 @@ DATABASE_URL = os.environ.get(
 
 engine = create_async_engine(
     DATABASE_URL,
-    echo=True
+    echo=True,
+    pool_pre_ping=True,
+    pool_recycle=300,
 )
 
 AsyncSessionLocal = sessionmaker(
