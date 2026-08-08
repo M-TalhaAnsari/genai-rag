@@ -18,47 +18,13 @@ captures the most important things known about the user.
 It is recomputed every N conversations to stay current.
 """
 
-import json
-from datetime import datetime
-from sqlalchemy import Column, Integer, String, Text, DateTime, select, func
+from sqlalchemy import  select, func
 from sqlalchemy.sql import func as sqlfunc
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.db.database import Base
-from backend.agents.configs import call_agent
-
-
-# ── Model ──────────────────────────────────────────────────────────────────
-
-class ConversationHistory(Base):
-    """Stores every conversation turn for every user, permanently."""
-
-    __tablename__ = "conversation_history"
-
-    id         = Column(Integer, primary_key=True, index=True)
-    user_id    = Column(String, nullable=False, index=True)
-    role       = Column(String, nullable=False)      # "user" | "assistant"
-    content    = Column(Text, nullable=False)
-    query      = Column(String, nullable=True)        # search query if applicable
-    created_at = Column(DateTime, server_default=sqlfunc.now())
-
-
-class UserMemorySummary(Base):
-    """
-    LLM-generated summary of what the system knows about the user.
-    Recomputed every 10 new conversation turns.
-    """
-
-    __tablename__ = "user_memory_summaries"
-
-    id            = Column(Integer, primary_key=True, index=True)
-    user_id       = Column(String, unique=True, nullable=False, index=True)
-    summary       = Column(Text, nullable=False)
-    turn_count    = Column(Integer, default=0)   # turns when last summarised
-    updated_at    = Column(DateTime, server_default=sqlfunc.now(),
-                           onupdate=sqlfunc.now())
-
-
+from backend.core.database import Base
+from backend.agents.llm import call_agent
+from backend.models.db_models import ConversationHistory, UserMemorySummary
 # ── Write operations ───────────────────────────────────────────────────────
 
 async def save_turn(

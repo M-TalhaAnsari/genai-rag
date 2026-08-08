@@ -10,8 +10,8 @@ import os
 
 from sqlalchemy import select
 
-from backend.db.database import AsyncSessionLocal, engine, Base
-from backend.model.models import Restaurant, Review
+from backend.core.database import AsyncSessionLocal, engine, Base
+from backend.models.db_models import Restaurant, Review
 from backend.retrieving import vector_store, bm25_store
 
 APIFY_EXPORT_PATH = "data/apify_export.json"

@@ -27,7 +27,7 @@ import asyncio
 
 from fastapi import HTTPException, status
 
-from backend.db.database import AsyncSessionLocal
+from backend.core.database import AsyncSessionLocal
 
 
 load_dotenv()
@@ -58,7 +58,7 @@ _groq = ChatGroq(
 
 _gemini = ChatGoogleGenerativeAI(
     api_key=os.environ.get("GOOGLE_API_KEY", ""),
-    model="gemini-1.5-flash",
+    model="gemini-3.5-flash",
     temperature=0.7,
 )
 

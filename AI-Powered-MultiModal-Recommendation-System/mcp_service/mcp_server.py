@@ -32,11 +32,11 @@ from fastmcp import FastMCP
 from backend.retrieving import retrieval as retrieval_module
 from backend.retrieving import vector_store, bm25_store
 from backend.agents.workflow import run_recommendation_workflow
-from backend.db.database import AsyncSessionLocal, engine, Base
-from backend import feedback as feedback_module
-from backend import analytics as analytics_module
+from backend.core.database import AsyncSessionLocal, engine, Base
+from backend.services import feedback_service as feedback_module
+from backend.services import analytics_service as analytics_module
 from sqlalchemy import select
-from backend.model.models import Restaurant
+from backend.models.schemas import Restaurant
 
 # ── Server init ────────────────────────────────────────────────────────────
 

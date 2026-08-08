@@ -23,7 +23,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from backend.agents.configs import call_agent
+from agents.llm import call_agent
 from backend.retrieving import retrieval as retrieval_module
 
 

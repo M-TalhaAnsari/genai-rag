@@ -14,7 +14,7 @@ This module is a lighter alternative for cases where:
 """
 
 import json
-from backend.agents.configs import call_agent
+from agents.llm import call_agent
 
 
 def rerank_with_reasoning(
