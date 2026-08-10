@@ -21,6 +21,7 @@ from backend.services.feedback_service import apply_profile_boost
 from backend.services.analytics_service import log_search
 from backend.services import memory_service
 
+from backend.retrieving.vector_store import search_by_review_sentiment
 
 async def hybrid_search(
     db: AsyncSession,
@@ -155,7 +156,6 @@ async def review_search(
     Search restaurants by their review summary content only.
     Useful for sentiment-heavy queries like 'clean and fast service'.
     """
-    from backend.retrieving.vector_store import search_by_review_sentiment
 
     confidence_rank = {"none": 0, "low": 1, "medium": 2, "high": 3}
     min_rank        = confidence_rank.get(min_confidence, 1)

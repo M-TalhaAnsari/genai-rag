@@ -12,6 +12,10 @@ from sqlalchemy import select
 from backend.core.database import get_db
 from backend.models.db_models import Restaurant, Review
 from backend.models.schemas import RestaurantDetail, ReviewOut
+from backend.retrieving.vector_store import get_restaurant_images as _get_images
+from backend.retrieving.vector_store import get_review_summary
+from backend.data_loader.review_summariser import summarise_reviews as _summarise
+from backend.retrieving.vector_store import upsert_review_summary
 
 router = APIRouter(prefix="/restaurants", tags=["restaurants"])
 
@@ -136,7 +140,7 @@ async def get_reviews(
 @router.get("/{restaurant_id}/review-summary")
 async def get_review_summary(restaurant_id: int):
     """Stored review quality summary from ChromaDB."""
-    from backend.retrieving.vector_store import get_review_summary
+
     data = get_review_summary(restaurant_id)
     if not data:
         raise HTTPException(
@@ -153,8 +157,6 @@ async def summarise_reviews(
     db: AsyncSession = Depends(get_db)
 ):
     """Generate a cautious review summary for one restaurant and embed it."""
-    from backend.data_loader.review_summariser import summarise_reviews as _summarise
-    from backend.retrieving.vector_store import upsert_review_summary
 
     r_result = await db.execute(
         select(Restaurant).where(Restaurant.id == restaurant_id)
@@ -185,3 +187,14 @@ async def summarise_reviews(
         **summary_data
     )
     return {"restaurant_id": restaurant_id, "summary_data": summary_data}
+
+
+@router.get("/{restaurant_id}/images")
+async def get_restaurant_images(restaurant_id: int):
+    """
+    All embedded images for one restaurant, tied by restaurant_id.
+    Returns empty list if no images have been enriched yet for this restaurant.
+    """
+
+    images = _get_images(restaurant_id)
+    return {"restaurant_id": restaurant_id, "image_count": len(images), "images": images}

@@ -21,7 +21,10 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from urllib.parse import quote, urlencode
 from sqlalchemy.ext.asyncio import AsyncSession
-from backend.model.models import Restaurant
+from backend.models.db_models import Restaurant
+
+from dotenv import load_dotenv
+load_dotenv()
 
 import asyncio 
 
@@ -29,6 +32,7 @@ from fastapi import HTTPException, status
 
 from backend.core.database import AsyncSessionLocal
 
+from sqlalchemy import select
 
 load_dotenv()
 

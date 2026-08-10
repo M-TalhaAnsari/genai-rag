@@ -14,8 +14,13 @@ WHY TWO COLLECTIONS:
 """
 
 import chromadb
+import json as _json
 from chromadb.config import Settings
+import torch
+from transformers import CLIPModel, CLIPProcessor
+
 from backend.retrieving.embedder import embed_restaurant, embed_text, embed_review_summary
+from backend.retrieving.data_enrichment import normalise_cuisine, extract_area
 
 _client = chromadb.PersistentClient(
     path="./chroma_data",
@@ -56,7 +61,6 @@ def upsert_restaurant(
     Build rich embedding text, embed it, and store in ChromaDB.
     Metadata includes normalised cuisine and area for filtering.
     """
-    from backend.retrieving.data_enrichment import normalise_cuisine, extract_area
 
     clean_cuisine = normalise_cuisine(cuisine, name)
     area = extract_area(address or "", city) or ""
@@ -166,7 +170,7 @@ def upsert_review_summary(
     Embed and store a restaurant's review summary with full quality metadata.
     Called after summarise_reviews() produces a validated summary.
     """
-    import json as _json
+
     embedding = embed_review_summary(restaurant_name, cuisine, city, summary)
 
     _reviews.upsert(
@@ -268,3 +272,193 @@ def get_review_summary(restaurant_id: int) -> dict | None:
         }
     except Exception:
         return None
+
+
+# ── Restaurant images (CLIP embeddings) ────────────────────────────────────
+# Third collection — image embeddings via CLIP (512-dim, cosine similarity).
+# Separate from text embeddings because CLIP and sentence-transformer
+# embeddings live in different vector spaces and cannot be mixed.
+#
+# Each document represents ONE image from a restaurant.
+# Multiple images per restaurant → multiple rows, all with same restaurant_id.
+# This lets a single image query match the best photo from each restaurant.
+
+_images = _client.get_or_create_collection(
+    name="restaurant_images",
+    metadata={"hnsw:space": "cosine"}
+)
+
+# CLIP model — loaded once, shared across all image embedding calls
+_clip_model     = None
+_clip_processor = None
+_clip_device    = None
+
+
+def _get_clip():
+    """Lazy-load CLIP so it doesn't slow startup if images aren't used."""
+    global _clip_model, _clip_processor, _clip_device
+    if _clip_model is None:
+        _clip_device    = "cuda" if torch.cuda.is_available() else "cpu"
+        _clip_model     = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(_clip_device)
+        _clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32", use_fast=True)
+        _clip_model.eval()
+    return _clip_model, _clip_processor, _clip_device
+
+
+def embed_image_from_bytes(image_bytes: bytes) -> list[float]:
+    """
+    Embed one image (raw bytes) using CLIP.
+    Returns a 512-dim normalised float list for ChromaDB.
+    """
+    import torch
+    import io
+    from PIL import Image
+
+    model, processor, device = _get_clip()
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+    with torch.no_grad():
+        inputs = processor(images=image, return_tensors="pt").to(device)
+        feats  = model.get_image_features(**inputs)
+        feats  = feats / feats.norm(dim=-1, keepdim=True)
+        return feats[0].cpu().numpy().tolist()
+
+
+def embed_text_clip(text: str) -> list[float]:
+    """
+    Embed a text query using CLIP's text encoder.
+    Used so text queries can match against image embeddings.
+    CLIP text and image embeddings share the same 512-dim space.
+    """
+    import torch
+
+    model, processor, device = _get_clip()
+
+    with torch.no_grad():
+        inputs = processor(text=[text], return_tensors="pt", padding=True).to(device)
+        feats  = model.get_text_features(**inputs)
+        feats  = feats / feats.norm(dim=-1, keepdim=True)
+        return feats[0].cpu().numpy().tolist()
+
+
+def upsert_restaurant_image(
+    restaurant_id: int,
+    image_index: int,
+    image_url: str,
+    image_bytes: bytes,
+    name: str,
+    cuisine: str,
+    city: str,
+) -> None:
+    """
+    Embed one restaurant image and store it in ChromaDB.
+
+    Each image gets a unique ID: f"img_{restaurant_id}_{image_index}"
+    Multiple images per restaurant are stored as separate rows —
+    all tied back to the same restaurant_id in metadata.
+
+    Args:
+        restaurant_id: PostgreSQL ID of the restaurant
+        image_index:   Position of this image in the restaurant's gallery (0-based)
+        image_url:     URL where the image can be retrieved (stored for display)
+        image_bytes:   Raw downloaded image bytes (used for embedding)
+        name/cuisine/city: Restaurant metadata — stored for search result display
+    """
+    embedding = embed_image_from_bytes(image_bytes)
+
+    _images.upsert(
+        ids=[f"img_{restaurant_id}_{image_index}"],
+        embeddings=[embedding],
+        documents=[image_url],          # store URL as the document text
+        metadatas=[{
+            "restaurant_id": restaurant_id,
+            "image_index":   image_index,
+            "image_url":     image_url,
+            "name":          name,
+            "cuisine":       cuisine,
+            "city":          city,
+        }]
+    )
+
+
+def search_by_image_text(query: str, top_k: int = 10) -> list[dict]:
+    """
+    Search restaurant images using a text query via CLIP.
+
+    CLIP's shared embedding space means text queries can match images
+    semantically — "rooftop with city view" finds photos of rooftop restaurants
+    even if that text appears nowhere in the metadata.
+
+    Returns one result per IMAGE (not per restaurant).
+    Use deduplicate=True to get one result per restaurant instead.
+    """
+    count = _images.count()
+    if count == 0:
+        return []
+
+    query_embedding = embed_text_clip(query)
+
+    results = _images.query(
+        query_embeddings=[query_embedding],
+        n_results=min(top_k, count),
+        include=["metadatas", "distances", "documents"]
+    )
+
+    hits = []
+    for meta, distance, doc in zip(
+        results["metadatas"][0],
+        results["distances"][0],
+        results["documents"][0]
+    ):
+        hits.append({
+            "restaurant_id": meta["restaurant_id"],
+            "name":          meta["name"],
+            "cuisine":       meta["cuisine"],
+            "city":          meta["city"],
+            "image_url":     meta["image_url"],
+            "image_index":   meta["image_index"],
+            "score":         round(1.0 - distance, 4),
+        })
+    return hits
+
+
+def search_by_image_text_deduped(query: str, top_k: int = 10) -> list[dict]:
+    """
+    Same as search_by_image_text but returns one result per restaurant.
+    Keeps the highest-scoring image per restaurant.
+    """
+    raw = search_by_image_text(query, top_k=top_k * 3)
+    seen: dict[int, dict] = {}
+    for hit in raw:
+        rid = hit["restaurant_id"]
+        if rid not in seen or hit["score"] > seen[rid]["score"]:
+            seen[rid] = hit
+    ranked = sorted(seen.values(), key=lambda x: x["score"], reverse=True)
+    return ranked[:top_k]
+
+
+def image_collection_count() -> int:
+    return _images.count()
+
+
+def get_restaurant_images(restaurant_id: int) -> list[dict]:
+    """
+    Fetch all stored image embeddings for one restaurant.
+    Returns list of {image_url, image_index, score=None}.
+    """
+    try:
+        result = _images.get(
+            where={"restaurant_id": restaurant_id},
+            include=["metadatas", "documents"]
+        )
+        if not result["ids"]:
+            return []
+        return [
+            {
+                "image_url":   meta["image_url"],
+                "image_index": meta["image_index"],
+            }
+            for meta in result["metadatas"]
+        ]
+    except Exception:
+        return []

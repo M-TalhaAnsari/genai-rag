@@ -25,6 +25,20 @@ from backend.models.db_models import Restaurant, Review
 from backend.models.schemas import RestaurantRequest, SyncResponse
 from backend.retrieving import vector_store, bm25_store
 
+from sqlalchemy import func
+from backend.models.db_models import Review as ReviewModel
+from backend.retrieving.vector_store import (review_collection_count,
+                                             upsert_review_summary, get_review_summary
+                                            )
+
+from backend.data_loader.restaurant_fetcher import fetch_all_cities, TARGET_CITIES
+from backend.data_loader.apify_loader import load_apify_export, _load_places
+from backend.data_loader.review_summariser import summarise_reviews as _summarise
+
+from backend.data_loader.apify_fetcher import _run_apify_scraper_resilient
+
+from backend.services.enrichment_services import enrich_restaurants
+
 router = APIRouter(prefix="/ingestion", tags=["ingestion"])
 
 
@@ -44,7 +58,7 @@ def fetch_restaurants(
     Free, no Apify credits used.
     OSM: no key required. Foursquare: FOURSQUARE_API_KEY (free 100k/month).
     """
-    from backend.data_loader.restaurant_fetcher import fetch_all_cities, TARGET_CITIES
+    
 
     city_list = (
         [c.strip() for c in cities.split(",") if c.strip()]
@@ -154,7 +168,6 @@ async def load_apify():
 
     For automated/scheduled loading, use POST /ingestion/n8n/sync-apify instead.
     """
-    from backend.data_loader.apify_loader import load_apify_export
 
     result = await load_apify_export()
     if "error" in result:
@@ -173,8 +186,6 @@ async def summarise_all_reviews(db: AsyncSession = Depends(get_db)):
     Run this once after /load-apify to populate the review_summaries collection.
     Already-summarised restaurants are skipped automatically.
     """
-    from backend.data_loader.review_summariser import summarise_reviews as _summarise
-    from backend.retrieving.vector_store import upsert_review_summary, get_review_summary
 
     r_result  = await db.execute(select(Restaurant))
     restaurants = r_result.scalars().all()
@@ -242,8 +253,6 @@ async def n8n_sync_apify(
       50  → first bootstrap run
       15  → scheduled weekly re-sync (cheaper, catches new openings)
     """
-    from backend.data_loader.apify_fetcher import _run_apify_scraper_resilient
-    from backend.data_loader.apify_loader import _load_places
 
     city_list = (
         [c.strip() for c in cities.split(",") if c.strip()]
@@ -305,4 +314,97 @@ async def n8n_apify_status(db: AsyncSession = Depends(get_db)):
         "by_source":         by_source,
         "chroma_vectors":    vector_store.collection_count(),
         "bm25_index_exists": bm25_store.index_exists(),
+    }
+
+
+# ── Google Places enrichment ───────────────────────────────────────────────
+
+@router.post("/enrich-reviews")
+async def enrich_reviews(
+    limit: int | None = Query(
+        default=50,
+        description="Max restaurants to enrich per run. Start small to test. None = all."
+    ),
+    only_without_reviews: bool = Query(
+        default=True,
+        description="Skip restaurants that already have reviews. Recommended: True."
+    ),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Enrich existing restaurants with reviews + photos from Google Places API.
+
+    Uses the placeId (external_id) already stored from Apify to call
+    Google Places Details — one call per restaurant, same response contains
+    both reviews and photo references.
+
+    For OSM-sourced restaurants without a placeId, does a Text Search first
+    to find the correct place, then fetches details.
+
+    Cost: ~$0.017 per restaurant. 600 restaurants ≈ $10.20 total.
+    Free tier: $200/month credit. Well within budget.
+
+    Required env var: GOOGLE_PLACES_API_KEY
+    Get a free key: console.cloud.google.com → APIs → Places API
+
+    Run order:
+      1. POST /ingestion/enrich-reviews?limit=10   ← test with 10 first
+      2. Check the reviews table in Neon
+      3. POST /ingestion/enrich-reviews?limit=None ← run on all if test looks good
+    """
+
+    try:
+        result = await enrich_restaurants(
+            db=db,
+            only_without_reviews=only_without_reviews,
+            limit=limit,
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+    return result
+
+
+@router.get("/enrich-status")
+async def enrich_status(db: AsyncSession = Depends(get_db)):
+    """
+    Check how many restaurants have been enriched with reviews.
+    Run this before and after /enrich-reviews to see progress.
+
+    Returns:
+      total_restaurants        — all restaurants in PostgreSQL
+      with_reviews             — restaurants that have at least one review
+      without_reviews          — restaurants still missing reviews
+      total_reviews            — total review rows in the reviews table
+      with_photos              — restaurants that have photo URLs stored
+      review_summaries_in_chroma — restaurants summarised in ChromaDB
+    """
+    
+
+    r_result = await db.execute(select(Restaurant))
+    all_restaurants = r_result.scalars().all()
+    total = len(all_restaurants)
+
+    have_photos = sum(1 for r in all_restaurants if r.photos)
+
+    review_result = await db.execute(
+        select(ReviewModel.restaurant_id).distinct()
+    )
+    enriched_ids = set(review_result.scalars().all())
+
+    total_reviews_result = await db.execute(
+        select(func.count()).select_from(ReviewModel)
+    )
+    total_reviews = total_reviews_result.scalar() or 0
+
+    return {
+        "total_restaurants":         total,
+        "with_reviews":              len(enriched_ids),
+        "without_reviews":           total - len(enriched_ids),
+        "total_reviews":             total_reviews,
+        "with_photos":               have_photos,
+        "review_summaries_in_chroma": review_collection_count(),
     }

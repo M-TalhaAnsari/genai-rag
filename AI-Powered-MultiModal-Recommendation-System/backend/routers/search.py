@@ -17,6 +17,13 @@ from backend.retrieving import retrieval, vector_store
 from backend.services import feedback_service as feedback_module
 from backend.services import analytics_service as analytics_module
 from backend.memory import session as session_memory
+from backend.retrieving.vector_store import (
+        search_by_image_text,
+        search_by_image_text_deduped,
+        image_collection_count,
+        search_by_review_sentiment,
+        review_collection_count
+    )
 
 router = APIRouter(prefix="/search", tags=["search"])
 
@@ -68,7 +75,7 @@ async def search_full(
     db: AsyncSession = Depends(get_db)
 ):
     """Three-signal search: BM25 + dense identity + review sentiment, RRF fused."""
-    from backend.retrieving.vector_store import search_by_review_sentiment, review_collection_count
+
 
     if vector_store.collection_count() == 0:
         raise HTTPException(status_code=503, detail="No restaurants indexed.")
@@ -147,12 +154,12 @@ async def search_by_review(
     min_confidence: str = Query(default="low")
 ):
     """Search restaurants by review summary content (sentiment-based)."""
-    from backend.retrieving.vector_store import search_by_review_sentiment, review_collection_count
+    from backend.vector_store import search_by_review_sentiment, review_collection_count
 
     if review_collection_count() == 0:
         raise HTTPException(
             status_code=503,
-            detail="No review summaries indexed. Run POST /restaurants/summarise-all first."
+            detail="No review summaries indexed. Run POST /ingestion/summarise-all-reviews first."
         )
 
     confidence_rank = {"none": 0, "low": 1, "medium": 2, "high": 3}
@@ -165,3 +172,56 @@ async def search_by_review(
     ][:top_k]
 
     return {"query": q, "result_count": len(results), "source": "review_summaries", "results": results}
+
+
+@router.get("/by-image")
+async def search_by_image(
+    q:      str = Query(..., min_length=1,
+                        description="e.g. 'rooftop seating with city view', 'plated biryani'"),
+    top_k:  int = Query(default=10, ge=1, le=30),
+    dedupe: bool = Query(default=True,
+                         description="One result per restaurant (best matching photo) vs one per image")
+):
+    """
+    Search restaurant photos using natural language via CLIP.
+
+    Matches text queries against actual restaurant images — "cozy indoor
+    seating" finds photos that visually show that, not restaurants whose
+    metadata happens to mention it.
+
+    Requires images to be embedded first via
+    POST /ingestion/enrich-reviews (embed_images=true).
+
+    Examples:
+      /search/by-image?q=rooftop seating city view
+      /search/by-image?q=plated biryani close up
+      /search/by-image?q=cozy indoor dining
+      /search/by-image?q=outdoor garden seating
+
+    dedupe=True  → one result per restaurant (its best-matching photo)
+    dedupe=False → one result per image (a restaurant can appear multiple times)
+    """
+    
+
+    if image_collection_count() == 0:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "No images indexed yet. Run POST /ingestion/enrich-reviews "
+                "with embed_images=true first."
+            )
+        )
+
+    results = (
+        search_by_image_text_deduped(query=q, top_k=top_k)
+        if dedupe else
+        search_by_image_text(query=q, top_k=top_k)
+    )
+
+    return {
+        "query":        q,
+        "result_count": len(results),
+        "source":       "restaurant_images",
+        "deduped":      dedupe,
+        "results":      results,
+    }
