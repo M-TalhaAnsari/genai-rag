@@ -9,7 +9,6 @@ This file only creates the app and mounts routers.
 from datetime import datetime
 from fastapi import FastAPI
 from backend.core.config import settings
-from backend.core.database import engine, Base
 from backend.models.schemas import HealthResponse
 
 from backend.routers.restaurants   import router as restaurants_router
@@ -21,6 +20,9 @@ from backend.routers.memory        import router as memory_router
 from backend.routers.analytics     import router as analytics_router
 from backend.routers.ingestion     import router as ingestion_router
 
+from backend.routers import auth as auth_router
+
+
 app = FastAPI(
     title=settings.APP_TITLE,
     description=settings.APP_DESCRIPTION,
@@ -28,12 +30,6 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
-
-
-@app.on_event("startup")
-async def startup():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
 
 
 @app.get("/", response_model=HealthResponse, tags=["health"])
@@ -62,4 +58,4 @@ app.include_router(feedback_router)
 app.include_router(memory_router)
 app.include_router(analytics_router)
 app.include_router(ingestion_router)
-
+app.include_router(auth_router.router)

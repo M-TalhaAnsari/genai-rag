@@ -12,13 +12,17 @@ from backend.core.database import get_db
 from backend.models.schemas import FeedbackRequest
 from backend.services import feedback_service as feedback_module
 
+from fastapi import APIRouter, Depends
+from backend.core.security import get_current_user
+from backend.models.db_models import User
+
 router = APIRouter(tags=["feedback"])
 
 
 @router.post("/feedback")
 async def submit_feedback(
     request: FeedbackRequest,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db), current_user: User=Depends(get_current_user)
 ):
     """
     Save a thumbs up (signal=1) or thumbs down (signal=-1).
@@ -33,7 +37,7 @@ async def submit_feedback(
 
     await feedback_module.save_feedback(
         db=db,
-        user_id=request.user_id,
+        user_id=current_user.id,
         restaurant_id=request.restaurant_id,
         restaurant_name=request.restaurant_name,
         cuisine=request.cuisine,
@@ -55,7 +59,7 @@ async def submit_feedback(
 @router.get("/profile/{user_id}")
 async def get_user_profile(
     user_id: str,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db), current_user: User= Depends(get_current_user)
 ):
     """
     Read the preference profile for a user derived from their feedback history.
@@ -68,6 +72,12 @@ async def get_user_profile(
 
     404 if the user has no feedback history yet.
     """
+    if current_user.id != user_id and current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot view another user's profile."
+        )
+    
     profile = await feedback_module.get_profile(db, user_id)
 
     if not profile:

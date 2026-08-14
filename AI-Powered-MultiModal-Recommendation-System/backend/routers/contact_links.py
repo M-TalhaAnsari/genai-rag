@@ -25,6 +25,7 @@ from backend.models.db_models import Restaurant
 from backend.models.schemas import ContactLinksResponse
 from backend.services.contact_service import get_contact_links
 
+
 router = APIRouter(
     prefix="/restaurants",
     tags=["contact links"]

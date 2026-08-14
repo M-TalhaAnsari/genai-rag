@@ -10,10 +10,6 @@ POST /ingestion/summarise-all-reviews   — batch generate review summaries
 POST /ingestion/n8n/sync-apify          — fully automated Apify sync (n8n calls this on schedule)
 GET  /ingestion/n8n/apify-status        — data volume check without triggering a sync
 
-Note on access control:
-  These endpoints write to the database and should eventually sit behind
-  admin auth (API key or JWT). For now they are open — add a dependency
-  like `Depends(verify_admin_key)` when you implement RBAC.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -39,17 +35,20 @@ from backend.data_loader.apify_fetcher import _run_apify_scraper_resilient
 
 from backend.services.enrichment_services import enrich_restaurants
 
+from fastapi import APIRouter, Depends
+from backend.core.security import require_admin
+
 router = APIRouter(prefix="/ingestion", tags=["ingestion"])
 
 
 # ── Fetch from OSM + Foursquare (n8n weekly sync) ──────────────────────────
 
-@router.get("/fetch-restaurants")
+@router.get("/fetch-restaurants", dependencies=[Depends(require_admin)])
 def fetch_restaurants(
     cities: str | None = Query(
         default=None,
         description="Comma-separated city names. Default: Lahore, Islamabad, Karachi, Rawalpindi"
-    )
+    ), 
 ):
     """
     Fetch real restaurant data from OSM + Foursquare.
@@ -76,7 +75,7 @@ def fetch_restaurants(
 
 # ── Restaurant sync (receives data from n8n or direct POST) ────────────────
 
-@router.post("/restaurant-sync", response_model=SyncResponse)
+@router.post("/restaurant-sync", response_model=SyncResponse, dependencies=[Depends(require_admin)])
 async def restaurant_sync(
     request: RestaurantRequest,
     db: AsyncSession = Depends(get_db)
@@ -156,7 +155,7 @@ async def restaurant_sync(
 
 # ── One-time manual Apify load ─────────────────────────────────────────────
 
-@router.post("/load-apify")
+@router.post("/load-apify", dependencies=[Depends(require_admin)])
 async def load_apify():
     """
     One-time bulk load from data/apify_export.json.
@@ -177,7 +176,7 @@ async def load_apify():
 
 # ── Batch review summarisation ─────────────────────────────────────────────
 
-@router.post("/summarise-all-reviews")
+@router.post("/summarise-all-reviews", dependencies=[Depends(require_admin)])
 async def summarise_all_reviews(db: AsyncSession = Depends(get_db)):
     """
     Generate cautious review summaries for all restaurants that have
@@ -233,7 +232,7 @@ async def summarise_all_reviews(db: AsyncSession = Depends(get_db)):
 
 # ── n8n automated Apify sync ───────────────────────────────────────────────
 
-@router.post("/n8n/sync-apify")
+@router.post("/n8n/sync-apify", dependencies=[Depends(require_admin)])
 async def n8n_sync_apify(
     cities: str | None = Query(default=None),
     per_city_limit: int = Query(default=15)
@@ -295,7 +294,7 @@ async def n8n_sync_apify(
     }
 
 
-@router.get("/n8n/apify-status")
+@router.get("/n8n/apify-status", dependencies=[Depends(require_admin)])
 async def n8n_apify_status(db: AsyncSession = Depends(get_db)):
     """
     Quick data volume check — n8n can poll this to verify freshness
@@ -319,7 +318,7 @@ async def n8n_apify_status(db: AsyncSession = Depends(get_db)):
 
 # ── Google Places enrichment ───────────────────────────────────────────────
 
-@router.post("/enrich-reviews")
+@router.post("/enrich-reviews",  dependencies=[Depends(require_admin)])
 async def enrich_reviews(
     limit: int | None = Query(
         default=50,
@@ -368,7 +367,7 @@ async def enrich_reviews(
     return result
 
 
-@router.get("/enrich-status")
+@router.get("/enrich-status",  dependencies=[Depends(require_admin)])
 async def enrich_status(db: AsyncSession = Depends(get_db)):
     """
     Check how many restaurants have been enriched with reviews.

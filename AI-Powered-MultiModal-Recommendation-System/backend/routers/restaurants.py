@@ -2,7 +2,6 @@
 backend/routers/restaurants.py
 --------------------------------
 Restaurant read endpoints.
-Write/ingest endpoints are in routers/ingestion.py.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -10,23 +9,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from backend.core.database import get_db
-from backend.models.db_models import Restaurant, Review
+from backend.core.security import get_current_user, require_admin
+from backend.models.db_models import Restaurant, Review, User
 from backend.models.schemas import RestaurantDetail, ReviewOut
 from backend.retrieving.vector_store import get_restaurant_images as _get_images
-from backend.retrieving.vector_store import get_review_summary
-from backend.data_loader.review_summariser import summarise_reviews as _summarise
+from backend.retrieving.vector_store import get_review_summary as _get_review_summary
 from backend.retrieving.vector_store import upsert_review_summary
+from backend.data_loader.review_summariser import summarise_reviews as _summarise
 
 router = APIRouter(prefix="/restaurants", tags=["restaurants"])
 
 
 @router.get("")
 async def list_restaurants(
-    city:    str | None = Query(default=None),
+    city: str | None = Query(default=None),
     cuisine: str | None = Query(default=None),
-    limit:   int        = Query(default=50, ge=1, le=500),
-    offset:  int        = Query(default=0, ge=0),
-    db: AsyncSession = Depends(get_db)
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """List restaurants with optional city/cuisine filter and pagination."""
     q = select(Restaurant)
@@ -45,18 +46,18 @@ async def list_restaurants(
         "limit": limit,
         "restaurants": [
             {
-                "id":          r.id,
-                "name":        r.name,
-                "cuisine":     r.cuisine,
-                "city":        r.city,
-                "area":        r.area,
-                "rating":      r.rating,
+                "id": r.id,
+                "name": r.name,
+                "cuisine": r.cuisine,
+                "city": r.city,
+                "area": r.area,
+                "rating": r.rating,
                 "price_level": r.price_level,
-                "address":     r.address,
-                "phone":       r.phone,
-                "website":     r.website,
-                "has_email":   bool(r.email),
-                "has_menu":    bool(r.menu_url),
+                "address": r.address,
+                "phone": r.phone,
+                "website": r.website,
+                "has_email": bool(r.email),
+                "has_menu": bool(r.menu_url),
                 "is_embedded": r.is_embedded,
             }
             for r in restaurants
@@ -67,7 +68,8 @@ async def list_restaurants(
 @router.get("/{restaurant_id}", response_model=RestaurantDetail)
 async def get_restaurant(
     restaurant_id: int,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Full detail for one restaurant including all reviews."""
     result = await db.execute(
@@ -106,7 +108,8 @@ async def get_restaurant(
 @router.get("/{restaurant_id}/reviews")
 async def get_reviews(
     restaurant_id: int,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """All reviews for a specific restaurant."""
     result = await db.execute(
@@ -122,15 +125,15 @@ async def get_reviews(
 
     return {
         "restaurant_id": restaurant_id,
-        "review_count":  len(reviews),
+        "review_count": len(reviews),
         "reviews": [
             {
-                "id":             r.id,
-                "reviewer_name":  r.reviewer_name,
-                "rating":         r.rating,
-                "text":           r.text,
+                "id": r.id,
+                "reviewer_name": r.reviewer_name,
+                "rating": r.rating,
+                "text": r.text,
                 "published_date": r.published_date,
-                "source":         r.source,
+                "source": r.source,
             }
             for r in reviews
         ]
@@ -138,10 +141,9 @@ async def get_reviews(
 
 
 @router.get("/{restaurant_id}/review-summary")
-async def get_review_summary(restaurant_id: int):
+async def get_review_summary_route(restaurant_id: int):
     """Stored review quality summary from ChromaDB."""
-
-    data = get_review_summary(restaurant_id)
+    data = _get_review_summary(restaurant_id)   # was self-calling before the fix
     if not data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -151,13 +153,15 @@ async def get_review_summary(restaurant_id: int):
     return data
 
 
-@router.post("/{restaurant_id}/summarise-reviews")
+@router.post("/{restaurant_id}/summarise-reviews", dependencies=[Depends(require_admin)])
 async def summarise_reviews(
     restaurant_id: int,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
-    """Generate a cautious review summary for one restaurant and embed it."""
-
+    """
+    Generate a cautious review summary for one restaurant and embed it.
+    Admin-only: this triggers an LLM call and writes to ChromaDB.
+    """
     r_result = await db.execute(
         select(Restaurant).where(Restaurant.id == restaurant_id)
     )
@@ -191,10 +195,6 @@ async def summarise_reviews(
 
 @router.get("/{restaurant_id}/images")
 async def get_restaurant_images(restaurant_id: int):
-    """
-    All embedded images for one restaurant, tied by restaurant_id.
-    Returns empty list if no images have been enriched yet for this restaurant.
-    """
-
+    """All embedded images for one restaurant."""
     images = _get_images(restaurant_id)
     return {"restaurant_id": restaurant_id, "image_count": len(images), "images": images}

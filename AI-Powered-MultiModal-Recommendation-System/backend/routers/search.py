@@ -1,13 +1,15 @@
 """
 backend/routers/search.py
 --------------------------
-Search endpoints.
+Search endpoints — PUBLIC, no login required.
 
 GET /search              — hybrid BM25 + dense + RRF
 GET /search/full         — three-signal (identity + review sentiment)
 GET /search/by-review    — review sentiment only
+GET /search/by-image     — CLIP image search
 """
 
+from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,22 +20,36 @@ from backend.services import feedback_service as feedback_module
 from backend.services import analytics_service as analytics_module
 from backend.memory import session as session_memory
 from backend.retrieving.vector_store import (
-        search_by_image_text,
-        search_by_image_text_deduped,
-        image_collection_count,
-        search_by_review_sentiment,
-        review_collection_count
-    )
+    search_by_image_text,
+    search_by_image_text_deduped,
+    image_collection_count,
+    search_by_review_sentiment,
+    review_collection_count
+)
 
 router = APIRouter(prefix="/search", tags=["search"])
 
 
+def _safe_uuid(user_id: str | None) -> UUID | None:
+    """user_id is now compared against a UUID column. A malformed or
+    made-up string (e.g. a leftover test value) would otherwise raise
+    a DB error and 500 the whole search. Since personalisation here is
+    optional, invalid input just falls back to anonymous instead of
+    breaking the request."""
+    if not user_id:
+        return None
+    try:
+        return UUID(user_id)
+    except ValueError:
+        return None
+
+
 @router.get("", response_model=SearchResponse)
 async def search(
-    q:       str           = Query(..., min_length=1),
-    top_k:   int           = Query(default=5, ge=1, le=20),
-    user_id: str | None    = Query(default=None),
-    db: AsyncSession = Depends(get_db)
+    q: str = Query(..., min_length=1),
+    top_k: int = Query(default=5, ge=1, le=20),
+    user_id: str | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
 ):
     """Hybrid search: ChromaDB dense + BM25 sparse → RRF fusion."""
     if vector_store.collection_count() == 0:
@@ -45,8 +61,9 @@ async def search(
     results = retrieval.hybrid_search(query=q, top_k=top_k)
 
     personalised = False
-    if user_id:
-        profile = await feedback_module.get_profile(db, user_id)
+    uid = _safe_uuid(user_id)
+    if uid:
+        profile = await feedback_module.get_profile(db, uid)
         if profile:
             results = feedback_module.apply_profile_boost(results, profile)
             personalised = True
@@ -67,16 +84,14 @@ async def search(
 
 @router.get("/full")
 async def search_full(
-    q:          str        = Query(..., min_length=1),
-    top_k:      int        = Query(default=5, ge=1, le=20),
-    user_id:    str | None = Query(default=None),
-    w_identity: float      = Query(default=0.6, ge=0.0, le=1.0),
-    w_review:   float      = Query(default=0.4, ge=0.0, le=1.0),
-    db: AsyncSession = Depends(get_db)
+    q: str = Query(..., min_length=1),
+    top_k: int = Query(default=5, ge=1, le=20),
+    user_id: str | None = Query(default=None),
+    w_identity: float = Query(default=0.6, ge=0.0, le=1.0),
+    w_review: float = Query(default=0.4, ge=0.0, le=1.0),
+    db: AsyncSession = Depends(get_db),
 ):
     """Three-signal search: BM25 + dense identity + review sentiment, RRF fused."""
-
-
     if vector_store.collection_count() == 0:
         raise HTTPException(status_code=503, detail="No restaurants indexed.")
 
@@ -103,10 +118,10 @@ async def search_full(
         effective_w = w_review * (0.5 if r.get("has_fake_signals") else 1.0)
         contribution = effective_w * (1.0 / (60 + rank))
         if rid in scores:
-            scores[rid]["review_score"]      = round(contribution, 6)
-            scores[rid]["review_summary"]    = r.get("review_summary")
+            scores[rid]["review_score"] = round(contribution, 6)
+            scores[rid]["review_summary"] = r.get("review_summary")
             scores[rid]["review_disclaimer"] = r.get("disclaimer")
-            scores[rid]["has_fake_signals"]  = r.get("has_fake_signals", False)
+            scores[rid]["has_fake_signals"] = r.get("has_fake_signals", False)
             scores[rid]["most_recent_review"] = r.get("most_recent_review")
         else:
             scores[rid] = {
@@ -128,8 +143,9 @@ async def search_full(
     ranked = sorted(scores.values(), key=lambda x: x["combined_score"], reverse=True)[:top_k]
 
     personalised = False
-    if user_id:
-        profile = await feedback_module.get_profile(db, user_id)
+    uid = _safe_uuid(user_id)
+    if uid:
+        profile = await feedback_module.get_profile(db, uid)
         if profile:
             ranked = feedback_module.apply_profile_boost(ranked, profile)
             personalised = True
@@ -149,13 +165,11 @@ async def search_full(
 
 @router.get("/by-review")
 async def search_by_review(
-    q:              str = Query(..., min_length=1),
-    top_k:          int = Query(default=5, ge=1, le=20),
-    min_confidence: str = Query(default="low")
+    q: str = Query(..., min_length=1),
+    top_k: int = Query(default=5, ge=1, le=20),
+    min_confidence: str = Query(default="low"),
 ):
     """Search restaurants by review summary content (sentiment-based)."""
-    from backend.vector_store import search_by_review_sentiment, review_collection_count
-
     if review_collection_count() == 0:
         raise HTTPException(
             status_code=503,
@@ -176,33 +190,13 @@ async def search_by_review(
 
 @router.get("/by-image")
 async def search_by_image(
-    q:      str = Query(..., min_length=1,
-                        description="e.g. 'rooftop seating with city view', 'plated biryani'"),
-    top_k:  int = Query(default=10, ge=1, le=30),
+    q: str = Query(..., min_length=1,
+                    description="e.g. 'rooftop seating with city view', 'plated biryani'"),
+    top_k: int = Query(default=10, ge=1, le=30),
     dedupe: bool = Query(default=True,
-                         description="One result per restaurant (best matching photo) vs one per image")
+                          description="One result per restaurant (best matching photo) vs one per image"),
 ):
-    """
-    Search restaurant photos using natural language via CLIP.
-
-    Matches text queries against actual restaurant images — "cozy indoor
-    seating" finds photos that visually show that, not restaurants whose
-    metadata happens to mention it.
-
-    Requires images to be embedded first via
-    POST /ingestion/enrich-reviews (embed_images=true).
-
-    Examples:
-      /search/by-image?q=rooftop seating city view
-      /search/by-image?q=plated biryani close up
-      /search/by-image?q=cozy indoor dining
-      /search/by-image?q=outdoor garden seating
-
-    dedupe=True  → one result per restaurant (its best-matching photo)
-    dedupe=False → one result per image (a restaurant can appear multiple times)
-    """
-    
-
+    """Search restaurant photos using natural language via CLIP."""
     if image_collection_count() == 0:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -219,9 +213,9 @@ async def search_by_image(
     )
 
     return {
-        "query":        q,
+        "query": q,
         "result_count": len(results),
-        "source":       "restaurant_images",
-        "deduped":      dedupe,
-        "results":      results,
+        "source": "restaurant_images",
+        "deduped": dedupe,
+        "results": results,
     }

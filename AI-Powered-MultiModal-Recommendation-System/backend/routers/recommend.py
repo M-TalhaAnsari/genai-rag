@@ -1,167 +1,109 @@
 """
-backend/routers/search.py
---------------------------
-Search endpoints.
-
-GET /search              — hybrid BM25 + dense + RRF
-GET /search/full         — three-signal (identity + review sentiment)
-GET /search/by-review    — review sentiment only
+backend/routers/recommend.py
+------------------------------
+POST /recommend — full 6-agent pipeline with SSE streaming.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+import json
+import asyncio
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.core.database import get_db
-from backend.models.schemas import SearchResponse, SearchResult
-from backend.retrieving import retrieval, vector_store
+from backend.models.schemas import RecommendRequest
+from backend.retrieving import vector_store
 from backend.services import feedback_service as feedback_module
 from backend.services import analytics_service as analytics_module
+from backend.agents.workflow import run_recommendation_workflow
 from backend.memory import session as session_memory
+from backend.memory.long_term import save_conversation
 
-router = APIRouter(prefix="/search", tags=["search"])
+from fastapi import APIRouter, Depends
+from backend.core.security import get_current_user
+from backend.models.db_models import User
 
 
-@router.get("", response_model=SearchResponse)
-async def search(
-    q:       str           = Query(..., min_length=1),
-    top_k:   int           = Query(default=5, ge=1, le=20),
-    user_id: str | None    = Query(default=None),
-    db: AsyncSession = Depends(get_db)
+router = APIRouter(tags=["recommend"])
+
+
+@router.post("/recommend")
+async def recommend(
+    request: RecommendRequest,
+    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
 ):
-    """Hybrid search: ChromaDB dense + BM25 sparse → RRF fusion."""
+    """
+    Full 6-agent recommendation pipeline with SSE streaming.
+
+    Streams phase updates so the user sees progress in real time
+    rather than waiting 30 seconds for a response.
+
+    Event types:
+      {"event": "phase",  "message": "Analysing your profile..."}
+      {"event": "result", "recommendations": [...], ...}
+      {"event": "done"}
+    """
     if vector_store.collection_count() == 0:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="No restaurants indexed. Run /ingestion/restaurant-sync first."
         )
 
-    results = retrieval.hybrid_search(query=q, top_k=top_k)
+    user_id = current_user.id
+    user_id_Str = str(current_user.id)
 
-    personalised = False
-    if user_id:
-        profile = await feedback_module.get_profile(db, user_id)
-        if profile:
-            results = feedback_module.apply_profile_boost(results, profile)
-            personalised = True
-        session_memory.add_query(user_id, q)
-        session_memory.add_results(user_id, results)
+    profile = await feedback_module.get_profile(db, user_id)
+    session_memory.add_query(user_id_Str, request.query)
+    session_memory.add_message(user_id_Str, "user", request.query)
 
-    await analytics_module.log_search(
-        db=db, query=q, result_count=len(results), user_id=user_id
-    )
+    async def event_stream():
+        phases = [
+            "Analysing your profile...",
+            "Retrieving candidates...",
+            "Running trend, style and nutrition analysis...",
+            "Generating personalised recommendations..."
+        ]
 
-    return SearchResponse(
-        query=q,
-        result_count=len(results),
-        personalised=personalised,
-        results=[SearchResult(**r) for r in results]
-    )
+        for phase_msg in phases:
+            yield f"data: {json.dumps({'event': 'phase', 'message': phase_msg})}\n\n"
+            await asyncio.sleep(0.05)
 
-
-@router.get("/full")
-async def search_full(
-    q:          str        = Query(..., min_length=1),
-    top_k:      int        = Query(default=5, ge=1, le=20),
-    user_id:    str | None = Query(default=None),
-    w_identity: float      = Query(default=0.6, ge=0.0, le=1.0),
-    w_review:   float      = Query(default=0.4, ge=0.0, le=1.0),
-    db: AsyncSession = Depends(get_db)
-):
-    """Three-signal search: BM25 + dense identity + review sentiment, RRF fused."""
-    from backend.retrieving.vector_store import search_by_review_sentiment, review_collection_count
-
-    if vector_store.collection_count() == 0:
-        raise HTTPException(status_code=503, detail="No restaurants indexed.")
-
-    identity_results = retrieval.hybrid_search(query=q, top_k=top_k * 2)
-    review_results = []
-    if review_collection_count() > 0:
-        review_results = search_by_review_sentiment(query=q, top_k=top_k * 2)
-
-    scores: dict[int, dict] = {}
-
-    for rank, r in enumerate(identity_results, start=1):
-        rid = r["restaurant_id"]
-        scores[rid] = {
-            "restaurant_id": rid, "name": r["name"],
-            "cuisine": r["cuisine"], "city": r["city"],
-            "identity_score": round(w_identity * (1.0 / (60 + rank)), 6),
-            "review_score": 0.0, "combined_score": 0.0,
-            "review_summary": None, "review_disclaimer": None,
-            "has_fake_signals": False, "most_recent_review": None,
-        }
-
-    for rank, r in enumerate(review_results, start=1):
-        rid = r["restaurant_id"]
-        effective_w = w_review * (0.5 if r.get("has_fake_signals") else 1.0)
-        contribution = effective_w * (1.0 / (60 + rank))
-        if rid in scores:
-            scores[rid]["review_score"]      = round(contribution, 6)
-            scores[rid]["review_summary"]    = r.get("review_summary")
-            scores[rid]["review_disclaimer"] = r.get("disclaimer")
-            scores[rid]["has_fake_signals"]  = r.get("has_fake_signals", False)
-            scores[rid]["most_recent_review"] = r.get("most_recent_review")
-        else:
-            scores[rid] = {
-                "restaurant_id": rid, "name": r["name"],
-                "cuisine": r["cuisine"], "city": r["city"],
-                "identity_score": 0.0,
-                "review_score": round(contribution, 6), "combined_score": 0.0,
-                "review_summary": r.get("review_summary"),
-                "review_disclaimer": r.get("disclaimer"),
-                "has_fake_signals": r.get("has_fake_signals", False),
-                "most_recent_review": r.get("most_recent_review"),
-            }
-
-    for rid in scores:
-        scores[rid]["combined_score"] = round(
-            scores[rid]["identity_score"] + scores[rid]["review_score"], 6
+        loop = asyncio.get_event_loop()
+        result_state = await loop.run_in_executor(
+            None,
+            lambda: run_recommendation_workflow(
+                query=request.query,
+                user_id=request.user_id or "anonymous",
+                profile=profile
+            )
         )
 
-    ranked = sorted(scores.values(), key=lambda x: x["combined_score"], reverse=True)[:top_k]
+        recommendations = result_state.get("final_recommendations", [])[:request.top_k]
 
-    personalised = False
-    if user_id:
-        profile = await feedback_module.get_profile(db, user_id)
-        if profile:
-            ranked = feedback_module.apply_profile_boost(ranked, profile)
-            personalised = True
-        session_memory.add_query(user_id, q)
+        assistant_response = (
+                        f"Found {len(recommendations)} recommendations for: {request.query}"
+                    )
+        
+        await save_conversation(
+            db=db,
+            user_id=user_id,
+            user_message=request.query,
+            assistant_response=assistant_response,
+            query=request.query
+        )
+        session_memory.add_message(user_id_Str, "assistant", assistant_response)
 
-    await analytics_module.log_search(
-        db=db, query=q, result_count=len(ranked), user_id=user_id
-    )
-
-    return {
-        "query": q, "result_count": len(ranked),
-        "personalised": personalised,
-        "weights": {"identity": w_identity, "review": w_review},
-        "results": ranked
-    }
-
-
-@router.get("/by-review")
-async def search_by_review(
-    q:              str = Query(..., min_length=1),
-    top_k:          int = Query(default=5, ge=1, le=20),
-    min_confidence: str = Query(default="low")
-):
-    """Search restaurants by review summary content (sentiment-based)."""
-    from backend.retrieving.vector_store import search_by_review_sentiment, review_collection_count
-
-    if review_collection_count() == 0:
-        raise HTTPException(
-            status_code=503,
-            detail="No review summaries indexed. Run POST /restaurants/summarise-all first."
+        await analytics_module.log_search(
+            db=db, query=request.query,
+            result_count=len(recommendations),
+            user_id=user_id
         )
 
-    confidence_rank = {"none": 0, "low": 1, "medium": 2, "high": 3}
-    min_rank = confidence_rank.get(min_confidence, 1)
-
-    results = search_by_review_sentiment(query=q, top_k=top_k * 2)
-    results = [
-        r for r in results
-        if confidence_rank.get(r.get("confidence", "none"), 0) >= min_rank
-    ][:top_k]
-
-    return {"query": q, "result_count": len(results), "source": "review_summaries", "results": results}
+        yield f"data: {json.dumps({'event': 'result', 'query': request.query, 'user_id': user_id_str, 'personalised': profile is not None, 'result_count': len(recommendations), 'recommendations': recommendations, 'debug': {'profile_summary': result_state.get('profile_summary', ''), 'candidates_after_filter': len(result_state.get('filtered_candidates', []))}})}\n\n"
+        yield f"data: {json.dumps({'event': 'done'})}\n\n"
+ 
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )

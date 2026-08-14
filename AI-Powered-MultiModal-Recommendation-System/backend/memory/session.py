@@ -22,12 +22,10 @@ from datetime import datetime
 from collections import deque
 from typing import Any
 
-# Max items kept per user per field
 MAX_QUERIES   = 20
 MAX_RESULTS   = 10
-MAX_MESSAGES  = 50   # conversation turns kept in memory
+MAX_MESSAGES  = 50   
 
-# Global session store: user_id → session dict
 _sessions: dict[str, dict] = {}
 
 

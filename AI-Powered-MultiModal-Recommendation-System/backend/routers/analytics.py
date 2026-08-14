@@ -13,10 +13,14 @@ from backend.services import analytics_service as analytics_module
 from backend.retrieving import vector_store, bm25_store
 from backend.memory import session as session_memory
 
+from fastapi import APIRouter, Depends
+from backend.core.security import get_current_user, require_admin
+from backend.models.db_models import User
+
 router = APIRouter(tags=["analytics"])
 
 
-@router.get("/analytics")
+@router.get("/analytics", dependencies=[Depends(require_admin)])
 async def get_analytics(db: AsyncSession = Depends(get_db)):
     """
     Aggregated analytics across all users and searches.
@@ -30,7 +34,7 @@ async def get_analytics(db: AsyncSession = Depends(get_db)):
     return await analytics_module.get_analytics(db)
 
 
-@router.get("/vector-stats")
+@router.get("/vector-stats", dependencies=[Depends(require_admin)])
 def vector_stats():
     """
     Debug: ChromaDB vector count, BM25 index status, active session count.

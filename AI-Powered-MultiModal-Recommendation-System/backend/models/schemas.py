@@ -117,14 +117,12 @@ class SearchResponse(BaseModel):
 
 class RecommendRequest(BaseModel):
     query:   str
-    user_id: Optional[str] = None
     top_k:   int           = Field(default=5, ge=1, le=10)
 
 
 # ── Feedback ───────────────────────────────────────────────────────────────
 
 class FeedbackRequest(BaseModel):
-    user_id:         str
     restaurant_id:   int
     restaurant_name: str
     cuisine:         str
@@ -183,3 +181,40 @@ class ContactRequest(BaseModel):
     message:         str
     user_name:       str
     user_query:      str
+
+
+"""
+Additions to backend/models/schemas.py
+"""
+
+from uuid import UUID
+from pydantic import BaseModel, EmailStr
+
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str  # validate min length in the route/service, not here
+
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class UserOut(BaseModel):
+    id: UUID
+    email: EmailStr
+    role: str
+
+    class Config:
+        from_attributes = True  # pydantic v2 (was orm_mode in v1)
+
+
+class TokenPair(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
