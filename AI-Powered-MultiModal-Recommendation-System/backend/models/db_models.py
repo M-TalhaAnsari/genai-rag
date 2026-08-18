@@ -174,6 +174,8 @@ class User(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
+    auth_provider = Column(String, default="local", nullable=False)  # "local" | "google" | "google_and_local"
+    google_id = Column(String, unique=True, nullable=True, index=True)
     role = Column(Enum(UserRole), default=UserRole.user, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -195,22 +197,3 @@ class RefreshToken(Base):
 
     user = relationship("User", back_populates="refresh_tokens")
 
-
-# ---------------------------------------------------------------------------
-# CHANGE existing tables — replace the free-text user_id columns with FKs.
-# Example for UserFeedback; apply the same pattern to UserProfile,
-# ConversationHistory, UserMemorySummary.
-# ---------------------------------------------------------------------------
-#
-# BEFORE:
-#   user_id = Column(String, nullable=False)
-#
-# AFTER:
-#   user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
-#
-# This requires an Alembic migration (or manual SQL) if you already have
-# rows with string user_ids from testing — those won't cast cleanly to
-# UUID and will need to be wiped or backfilled against real User rows
-# before the FK constraint can be applied. Since you're pre-launch and
-# this is test data, easiest path is likely: drop and recreate those
-# four tables rather than migrate placeholder data.

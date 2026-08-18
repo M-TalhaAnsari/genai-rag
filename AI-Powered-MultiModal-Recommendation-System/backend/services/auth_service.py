@@ -47,13 +47,18 @@ async def create_user(db: AsyncSession, email: str, password: str, role: UserRol
 
 
 async def authenticate_user(db: AsyncSession, email: str, password: str) -> User:
+
+
     result = await db.execute(select(User).where(User.email == email))
     user = result.scalar_one_or_none()
+ 
+    if user is None or user.hashed_password is None:
+        # Either no such user, or they signed up via Google and have
+        # no password to check — same generic error either way, so
+        # we don't leak which case it is.
+        raise AuthError("Incorrect email or password")
 
-    if user is None or not verify_password(password, user.hashed_password):
-        # Deliberately identical error for "no such user" and "wrong
-        # password" — don't leak which one it was, that's a user
-        # enumeration vector.
+    if not verify_password(password, user.hashed_password):
         raise AuthError("Incorrect email or password")
 
     if not user.is_active:

@@ -33,5 +33,9 @@ class Settings:
 
     REDIS_URL: str = "redis://localhost:6379/0"
     SESSION_TTL_SECONDS: int = 7200   
-    
+    GOOGLE_CLIENT_ID: str
+    GOOGLE_CLIENT_SECRET: str
+    GOOGLE_REDIRECT_URI: str = "http://127.0.0.1:8000/auth/google/callback"
+    FRONTEND_URL: str = "http://localhost:8501"  
+
 settings = Settings()
