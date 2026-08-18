@@ -67,8 +67,8 @@ async def search(
         if profile:
             results = feedback_module.apply_profile_boost(results, profile)
             personalised = True
-        session_memory.add_query(user_id, q)
-        session_memory.add_results(user_id, results)
+        await session_memory.add_query(user_id, q)
+        await session_memory.add_results(user_id, results)
 
     await analytics_module.log_search(
         db=db, query=q, result_count=len(results), user_id=user_id
@@ -149,7 +149,7 @@ async def search_full(
         if profile:
             ranked = feedback_module.apply_profile_boost(ranked, profile)
             personalised = True
-        session_memory.add_query(user_id, q)
+        await session_memory.add_query(user_id, q)
 
     await analytics_module.log_search(
         db=db, query=q, result_count=len(ranked), user_id=user_id

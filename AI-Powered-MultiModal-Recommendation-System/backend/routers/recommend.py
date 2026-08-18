@@ -53,8 +53,8 @@ async def recommend(
     user_id_Str = str(current_user.id)
 
     profile = await feedback_module.get_profile(db, user_id)
-    session_memory.add_query(user_id_Str, request.query)
-    session_memory.add_message(user_id_Str, "user", request.query)
+    await session_memory.add_query(user_id_Str, request.query)
+    await session_memory.add_message(user_id_Str, "user", request.query)
 
     async def event_stream():
         phases = [
@@ -91,7 +91,7 @@ async def recommend(
             assistant_response=assistant_response,
             query=request.query
         )
-        session_memory.add_message(user_id_Str, "assistant", assistant_response)
+        await session_memory.add_message(user_id_Str, "assistant", assistant_response)
 
         await analytics_module.log_search(
             db=db, query=request.query,

@@ -40,7 +40,7 @@ async def get_user_memory(
             detail="Cannot view another user's memory."
         )
     long_term = await get_full_memory_context(db, user_id)
-    session   = session_memory.get_session_summary(user_id)
+    session   = await session_memory.get_session_summary(user_id)
 
     return {
         "user_id":   user_id,

@@ -44,5 +44,5 @@ def vector_stats():
         "chroma_restaurants":   vector_store.collection_count(),
         "chroma_reviews":       vector_store.review_collection_count(),
         "bm25_index_exists":    bm25_store.index_exists(),
-        "active_sessions":      session_memory.active_sessions(),
+        "active_sessions":      await session_memory.active_sessions(),
     }

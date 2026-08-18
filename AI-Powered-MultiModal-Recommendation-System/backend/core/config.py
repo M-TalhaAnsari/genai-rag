@@ -31,5 +31,7 @@ class Settings:
     APP_TITLE: str = "Connoisseur Restaurant API"
     APP_DESCRIPTION: str = "AI-powered restaurant discovery for Pakistan"
 
-
+    REDIS_URL: str = "redis://localhost:6379/0"
+    SESSION_TTL_SECONDS: int = 7200   
+    
 settings = Settings()
