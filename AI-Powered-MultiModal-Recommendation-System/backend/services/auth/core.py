@@ -1,5 +1,5 @@
 """
-backend/services/auth_service.py
+backend/services/auth/core.py  (formerly services/auth_service.py)
 
 Business logic only — no `from fastapi import ...` here, same rule as
 every other file in services/. This is what makes it callable from a
@@ -10,8 +10,8 @@ HTTP responses. Token *encoding* lives in core/security.py; this file
 is about *what happens* (create a user, check credentials, manage
 refresh-token rows) — not the cryptography itself.
 """
-
-from datetime import datetime, timezone
+import secrets
+from datetime import datetime, timezone, timedelta
 from uuid import UUID
 
 from sqlalchemy import select, update
@@ -24,7 +24,13 @@ from backend.core.security import (
     create_refresh_token,
     decode_token,
 )
+from backend.core.redis_client import redis_client
+
 from backend.models.db_models import User, RefreshToken, UserRole
+from backend.services.auth import email as email_service
+
+VERIFICATION_TOKEN_TTL_SECONDS = 24 * 60 * 60  # 24h
+STALE_UNVERIFIED_THRESHOLD = timedelta(hours=24)
 
 
 class AuthError(Exception):
@@ -35,36 +41,93 @@ class AuthError(Exception):
 
 
 async def create_user(db: AsyncSession, email: str, password: str, role: UserRole = UserRole.user) -> User:
-    existing = await db.execute(select(User).where(User.email == email))
-    if existing.scalar_one_or_none() is not None:
-        raise AuthError("Email already registered")
+    existing_result = await db.execute(select(User).where(User.email == email))
+    existing = existing_result.scalar_one_or_none()
 
-    user = User(email=email, hashed_password=hash_password(password), role=role)
+    if existing is not None:
+        if existing.email_verified:
+            raise AuthError("Email already registered")
+
+        # Unverified squat: only reclaim if it's stale. A fresh
+        # unverified row (user mid-signup, hasn't checked inbox yet)
+        # should NOT be silently deleted out from under them.
+        age = datetime.now(timezone.utc) - existing.created_at.replace(tzinfo=timezone.utc)
+        if age < STALE_UNVERIFIED_THRESHOLD:
+            raise AuthError(
+                "Email already registered — check your inbox for a verification link, "
+                "or use 'resend verification' if it expired."
+            )
+
+        await db.delete(existing)
+        await db.flush()
+
+    user = User(
+        email=email,
+        hashed_password=hash_password(password),
+        role=role,
+        email_verified=False,
+    )
     db.add(user)
     await db.commit()
     await db.refresh(user)
+
+    await send_verification_email(user)
     return user
 
 
 async def authenticate_user(db: AsyncSession, email: str, password: str) -> User:
-
-
     result = await db.execute(select(User).where(User.email == email))
     user = result.scalar_one_or_none()
- 
+
     if user is None or user.hashed_password is None:
-        # Either no such user, or they signed up via Google and have
-        # no password to check — same generic error either way, so
-        # we don't leak which case it is.
         raise AuthError("Incorrect email or password")
 
     if not verify_password(password, user.hashed_password):
         raise AuthError("Incorrect email or password")
 
+    if not user.email_verified:
+        raise AuthError("Please verify your email before logging in.")
+
     if not user.is_active:
         raise AuthError("Account is disabled")
 
     return user
+
+
+async def send_verification_email(user: User) -> None:
+    token = secrets.token_urlsafe(32)
+    await redis_client.set(
+        f"email_verify:{token}", str(user.id), ex=VERIFICATION_TOKEN_TTL_SECONDS
+    )
+    email_service.send_verification_email(user.email, token)
+
+
+async def verify_email_token(db: AsyncSession, token: str) -> User:
+    key = f"email_verify:{token}"
+    user_id_str = await redis_client.get(key)
+    if not user_id_str:
+        raise AuthError("Invalid or expired verification link.")
+    await redis_client.delete(key)
+
+    result = await db.execute(select(User).where(User.id == UUID(user_id_str)))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise AuthError("User not found.")
+
+    user.email_verified = True
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+
+async def resend_verification(db: AsyncSession, email: str) -> None:
+    result = await db.execute(select(User).where(User.email == email))
+    user = result.scalar_one_or_none()
+    # Same response whether or not the account exists / is already
+    # verified — don't let this endpoint be used to probe which
+    # emails are registered.
+    if user and not user.email_verified:
+        await send_verification_email(user)
 
 
 async def issue_token_pair(db: AsyncSession, user: User) -> tuple[str, str]:

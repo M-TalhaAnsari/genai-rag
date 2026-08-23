@@ -179,7 +179,7 @@ class User(Base):
     role = Column(Enum(UserRole), default=UserRole.user, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
-
+    email_verified = Column(Boolean, nullable=False, server_default="false")
     refresh_tokens = relationship(
         "RefreshToken", back_populates="user", cascade="all, delete-orphan"
     )

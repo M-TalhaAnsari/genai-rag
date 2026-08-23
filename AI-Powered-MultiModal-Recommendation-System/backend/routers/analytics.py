@@ -35,7 +35,7 @@ async def get_analytics(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/vector-stats", dependencies=[Depends(require_admin)])
-def vector_stats():
+async def vector_stats():
     """
     Debug: ChromaDB vector count, BM25 index status, active session count.
     Useful after a sync to confirm embeddings were stored correctly.

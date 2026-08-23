@@ -33,9 +33,17 @@ class Settings:
 
     REDIS_URL: str = "redis://localhost:6379/0"
     SESSION_TTL_SECONDS: int = 7200   
-    GOOGLE_CLIENT_ID: str
-    GOOGLE_CLIENT_SECRET: str
+    GOOGLE_CLIENT_ID: str = os.environ.get("GOOGLE_CLIENT_ID", "")
+    GOOGLE_CLIENT_SECRET: str = os.environ.get("GOOGLE_CLIENT_SECRET", "")
     GOOGLE_REDIRECT_URI: str = "http://127.0.0.1:8000/auth/google/callback"
     FRONTEND_URL: str = "http://localhost:8501"  
+    # Add to the settings class. All optional — email_service.py falls
+    # back to console-logging the link if SMTP_HOST is unset, so local
+    # dev works with zero configuration.
+    SMTP_HOST: str | None = None
+    SMTP_PORT: int = 587
+    SMTP_USER: str | None = None
+    SMTP_PASSWORD: str | None = None
+    SMTP_FROM: str = "noreply@connoisseur.app"
 
 settings = Settings()
