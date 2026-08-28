@@ -14,7 +14,7 @@ from backend.retrieving import vector_store, bm25_store
 from backend.memory import session as session_memory
 
 from fastapi import APIRouter, Depends
-from backend.core.security import get_current_user, require_admin
+from backend.core.security import require_admin
 from backend.models.db_models import User
 
 router = APIRouter(tags=["analytics"])
