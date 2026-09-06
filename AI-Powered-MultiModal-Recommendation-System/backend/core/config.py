@@ -46,4 +46,7 @@ class Settings:
     SMTP_PASSWORD: str | None = None
     SMTP_FROM: str = "noreply@connoisseur.app"
 
+
+    BACKEND_URL: str = "http://localhost:8000"
+
 settings = Settings()

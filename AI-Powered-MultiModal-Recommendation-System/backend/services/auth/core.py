@@ -1,14 +1,6 @@
 """
 backend/services/auth/core.py  (formerly services/auth_service.py)
 
-Business logic only — no `from fastapi import ...` here, same rule as
-every other file in services/. This is what makes it callable from a
-script, a test, or a future admin CLI without dragging in FastAPI.
-
-Routers call these functions and translate results/exceptions into
-HTTP responses. Token *encoding* lives in core/security.py; this file
-is about *what happens* (create a user, check credentials, manage
-refresh-token rows) — not the cryptography itself.
 """
 import secrets
 from datetime import datetime, timezone, timedelta
@@ -31,6 +23,7 @@ from backend.services.auth import email as email_service
 
 VERIFICATION_TOKEN_TTL_SECONDS = 24 * 60 * 60  # 24h
 STALE_UNVERIFIED_THRESHOLD = timedelta(hours=24)
+LOGIN_CODE_TTL_SECONDS = 60  # frontend should exchange this immediately
 
 
 class AuthError(Exception):
@@ -41,6 +34,8 @@ class AuthError(Exception):
 
 
 async def create_user(db: AsyncSession, email: str, password: str, role: UserRole = UserRole.user) -> User:
+    email = email.strip().lower()
+
     existing_result = await db.execute(select(User).where(User.email == email))
     existing = existing_result.scalar_one_or_none()
 
@@ -48,9 +43,6 @@ async def create_user(db: AsyncSession, email: str, password: str, role: UserRol
         if existing.email_verified:
             raise AuthError("Email already registered")
 
-        # Unverified squat: only reclaim if it's stale. A fresh
-        # unverified row (user mid-signup, hasn't checked inbox yet)
-        # should NOT be silently deleted out from under them.
         age = datetime.now(timezone.utc) - existing.created_at.replace(tzinfo=timezone.utc)
         if age < STALE_UNVERIFIED_THRESHOLD:
             raise AuthError(
@@ -76,6 +68,7 @@ async def create_user(db: AsyncSession, email: str, password: str, role: UserRol
 
 
 async def authenticate_user(db: AsyncSession, email: str, password: str) -> User:
+    email = email.strip().lower()
     result = await db.execute(select(User).where(User.email == email))
     user = result.scalar_one_or_none()
 
@@ -121,11 +114,9 @@ async def verify_email_token(db: AsyncSession, token: str) -> User:
 
 
 async def resend_verification(db: AsyncSession, email: str) -> None:
+    email = email.strip().lower()
     result = await db.execute(select(User).where(User.email == email))
     user = result.scalar_one_or_none()
-    # Same response whether or not the account exists / is already
-    # verified — don't let this endpoint be used to probe which
-    # emails are registered.
     if user and not user.email_verified:
         await send_verification_email(user)
 
@@ -144,9 +135,6 @@ async def issue_token_pair(db: AsyncSession, user: User) -> tuple[str, str]:
 async def rotate_refresh_token(db: AsyncSession, refresh_token_str: str) -> tuple[str, str]:
     """
     Validates a refresh token, revokes it, and issues a brand new pair.
-    Rotation (not reuse) on every refresh means a stolen-and-replayed
-    old refresh token is detectably invalid the moment the legitimate
-    client refreshes — the revoked row is the tell.
     """
     payload = decode_token(refresh_token_str)
     if payload.get("type") != "refresh":
@@ -159,9 +147,6 @@ async def rotate_refresh_token(db: AsyncSession, refresh_token_str: str) -> tupl
     stored = result.scalar_one_or_none()
 
     if stored is None or stored.revoked:
-        # Either unknown or already-used-once token — treat as
-        # compromised. In a hardened version you'd also revoke ALL
-        # of this user's refresh tokens here (reuse-detection response).
         raise AuthError("Refresh token invalid or already used")
 
     if stored.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
@@ -200,3 +185,17 @@ async def revoke_all_user_tokens(db: AsyncSession, user_id: UUID) -> None:
         update(RefreshToken).where(RefreshToken.user_id == user_id).values(revoked=True)
     )
     await db.commit()
+
+async def create_login_code(user_id) -> str:
+    code = secrets.token_urlsafe(32)
+    await redis_client.set(f"login_code:{code}", str(user_id), ex=LOGIN_CODE_TTL_SECONDS)
+    return code
+
+
+async def redeem_login_code(code: str) -> str:
+    key = f"login_code:{code}"
+    user_id_str = await redis_client.get(key)
+    if not user_id_str:
+        raise AuthError("Invalid or expired login code.")
+    await redis_client.delete(key)  # single use
+    return user_id_str
