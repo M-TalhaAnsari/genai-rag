@@ -254,7 +254,6 @@ async def _load_places(raw_data: list[dict]) -> dict:
         newly_inserted: list[tuple[Restaurant, list[dict]]] = []
 
         for place in raw_data:
-            # Skip closed places defensively (actor input should already filter these)
             if place.get("permanentlyClosed") or place.get("temporarilyClosed"):
                 skipped += 1
                 continue
@@ -266,38 +265,37 @@ async def _load_places(raw_data: list[dict]) -> dict:
 
             try:
                 restaurant_data, reviews = normalize_apify_place(place)
-            except Exception as e:
-                errors.append(f"normalise error: {e}")
-                continue
+                name = restaurant_data.get("name", "").strip()
+                external_id = restaurant_data.get("external_id")
 
-            name = restaurant_data.get("name", "").strip()
-            external_id = restaurant_data.get("external_id")
+                if not name:
+                    skipped += 1
+                    continue
 
-            if not name:
-                skipped += 1
-                continue
-
-            # Dedup by placeId first (correct for chain branches), name+city fallback
-            if external_id:
-                result = await db.execute(
-                    select(Restaurant).where(Restaurant.external_id == external_id)
-                )
-            else:
-                result = await db.execute(
-                    select(Restaurant).where(
-                        Restaurant.name == name,
-                        Restaurant.city == restaurant_data.get("city", "")
+                if external_id:
+                    result = await db.execute(
+                        select(Restaurant).where(Restaurant.external_id == external_id)
                     )
-                )
+                else:
+                    result = await db.execute(
+                        select(Restaurant).where(
+                            Restaurant.name == name,
+                            Restaurant.city == restaurant_data.get("city", "")
+                        )
+                    )
 
-            if result.scalars().first():
-                skipped += 1
+                if result.scalars().first():
+                    skipped += 1
+                    continue
+
+                record = Restaurant(**restaurant_data, is_embedded=False)
+                db.add(record)
+                newly_inserted.append((record, reviews))
+                inserted += 1
+
+            except Exception as e:
+                errors.append(f"place error ({place.get('title', '?')}): {e}")
                 continue
-
-            record = Restaurant(**restaurant_data, is_embedded=False)
-            db.add(record)
-            newly_inserted.append((record, reviews))
-            inserted += 1
 
         await db.commit()
 

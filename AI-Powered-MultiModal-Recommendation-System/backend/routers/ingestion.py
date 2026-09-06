@@ -235,31 +235,18 @@ async def summarise_all_reviews(db: AsyncSession = Depends(get_db)):
 @router.post("/n8n/sync-apify", dependencies=[Depends(require_admin)])
 async def n8n_sync_apify(
     cities: str | None = Query(default=None),
-    per_city_limit: int = Query(default=15)
+    per_city_limit: int = Query(default=5, description="Keep small on a tight budget — test before scaling"),
+    max_reviews: int = Query(default=5),
+    max_images: int = Query(default=3),
 ):
-    """
-    Fully automated, credit-loss-resilient Apify sync triggered by n8n.
-
-    Flow:
-      1. Starts Apify actor run (non-blocking)
-      2. Polls status every 10 seconds
-      3. Fetches dataset regardless of how the run ended
-         (credits exhausted mid-run → partial data still saved)
-      4. Filters to Pakistan only (countryCode=PK)
-      5. Inserts new restaurants → PostgreSQL + ChromaDB + BM25 + review summaries
-
-    per_city_limit:
-      50  → first bootstrap run
-      15  → scheduled weekly re-sync (cheaper, catches new openings)
-    """
-
     city_list = (
         [c.strip() for c in cities.split(",") if c.strip()]
-        if cities
-        else ["Lahore", "Islamabad", "Karachi", "Rawalpindi"]
+        if cities else ["Lahore", "Islamabad", "Karachi", "Rawalpindi"]
     )
 
-    raw_places, run_info = await _run_apify_scraper_resilient(city_list, per_city_limit)
+    raw_places, run_info, snapshot_path = await _run_apify_scraper_resilient(
+        city_list, per_city_limit, max_reviews=max_reviews, max_images=max_images
+    )
 
     if not raw_places:
         return {
@@ -271,7 +258,20 @@ async def n8n_sync_apify(
             "skipped":     0,
         }
 
-    result = await _load_places(raw_places)
+    try:
+        result = await _load_places(raw_places)
+    except Exception as e:
+        # Data is already safe on disk — nothing lost, just retry the DB step.
+        return {
+            "message": (
+                "Apify fetch succeeded and was saved to disk, but the database "
+                "step failed. No Apify credits were wasted — retry by pointing "
+                "/ingestion/load-apify at this file."
+            ),
+            "snapshot_path": snapshot_path,
+            "error": str(e),
+            "raw_places_fetched": len(raw_places),
+        }
 
     total_processed = result["inserted"] + result["skipped"]
     duplicate_ratio = (
@@ -288,6 +288,7 @@ async def n8n_sync_apify(
         "is_partial":             run_info["is_partial"],
         "run_message":            run_info["message"],
         "cities":                 city_list,
+        "snapshot_path":          snapshot_path,
         "raw_places_fetched":     len(raw_places),
         "new_vs_duplicate_ratio": f"{duplicate_ratio}% already in database",
         **result,

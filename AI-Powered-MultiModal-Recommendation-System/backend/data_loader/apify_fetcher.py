@@ -1,17 +1,3 @@
-"""
-backend/contact.py
--------------------
-Two responsibilities:
-
-1. generate_contact_message()
-   Uses Groq/Gemini to write a natural, polite contact message
-   on behalf of the user to a restaurant.
-
-2. trigger_n8n_contact()
-   Calls the n8n webhook with full restaurant + message data.
-   n8n then routes to email / WhatsApp / booking based on
-   what contact info the restaurant has.
-"""
 
 import os
 import httpx
@@ -45,6 +31,8 @@ APIFY_DATASET_ITEMS_URL = "https://api.apify.com/v2/datasets/{dataset_id}/items"
 
 
 TARGET_COUNTRY_CODE = "pk"
+
+DATA_DIR = "data/apify_raw"
 
 # Polling config
 POLL_INTERVAL_SECONDS = 10
@@ -371,20 +359,40 @@ async def _get_restaurant_contact_method(restaurant_id: int) -> dict:
 
 
 # ── Apify API call ──────────────────────────────────────────────────────────
+TARGET_COUNTRY_CODE = "PK"   # was lowercase "pk" — keep consistent with post-filter check
+
+DATA_DIR = "data/apify_raw"
+
+
+def _save_raw_snapshot(raw_places: list[dict], run_id: str) -> str:
+    """
+    Persist the raw Apify response to disk BEFORE any DB/embedding work touches it.
+    If the DB pipeline crashes afterward, you re-run from this file — zero Apify
+    credits wasted, because the expensive part (the actor run) already happened
+    and its output is safe on disk.
+    """
+    import json
+    from datetime import datetime, timezone
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = f"{DATA_DIR}/run_{run_id}_{ts}.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(raw_places, f, ensure_ascii=False)
+    print(f"[apify] Raw snapshot saved: {path} ({len(raw_places)} places)")
+    return path
+
 
 async def _run_apify_scraper_resilient(
     cities: list[str],
-    per_city_limit: int
-) -> tuple[list[dict], dict]:
+    per_city_limit: int,
+    max_reviews: int = 5,
+    max_images: int = 3,
+) -> tuple[list[dict], dict, str]:
     """
-    Start an Apify run, poll it, and fetch dataset items no matter how
-    the run ends. 
-
-    Returns:
-        (raw_places, run_info)
-        raw_places: list of scraped place dicts (may be partial if the
-                    run didn't finish — that's fine, we still use them)
-        run_info:   {"status": str, "is_partial": bool, "message": str}
+    Returns (raw_places, run_info, snapshot_path) — snapshot_path is the on-disk
+    copy, so callers always have a fallback file to reload from if downstream
+    processing fails.
     """
     token = _get_apify_token()
     search_terms = [f"restaurants in {city} Pakistan" for city in cities]
@@ -393,13 +401,15 @@ async def _run_apify_scraper_resilient(
         "searchStringsArray":        search_terms,
         "maxCrawledPlacesPerSearch": per_city_limit,
         "language":                  "en",
-        "countryCode":               TARGET_COUNTRY_CODE,   # restrict to Pakistan
+        "countryCode":               TARGET_COUNTRY_CODE,
+        "maxReviews":                max_reviews,     # ← was missing entirely
+        "maxImages":                 max_images,       # ← was missing entirely
+        "scrapeReviewsPersonalData": False,             # reviewer PII not needed, cheaper
         "exportPlaceUrls":           False,
         "skipClosedPlaces":          True,
     }
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        # Step 1: start the run — returns immediately, does not wait
         try:
             start_resp = await client.post(
                 APIFY_START_RUN_URL,
@@ -413,9 +423,9 @@ async def _run_apify_scraper_resilient(
                 detail=f"Apify failed to start run: {e.response.status_code} {e.response.text[:300]}"
             )
 
-        run_data    = start_resp.json().get("data", {})
-        run_id      = run_data.get("id")
-        dataset_id  = run_data.get("defaultDatasetId")
+        run_data   = start_resp.json().get("data", {})
+        run_id     = run_data.get("id")
+        dataset_id = run_data.get("defaultDatasetId")
 
         if not run_id or not dataset_id:
             raise HTTPException(
@@ -424,14 +434,11 @@ async def _run_apify_scraper_resilient(
             )
 
         print(f"[apify] Run started: {run_id} (dataset: {dataset_id})")
-
-        # Step 2: poll until terminal status or max attempts reached
         final_status = "UNKNOWN"
         status_message = ""
 
         for attempt in range(MAX_POLL_ATTEMPTS):
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
-
             try:
                 status_resp = await client.get(
                     APIFY_RUN_STATUS_URL.format(run_id=run_id),
@@ -441,12 +448,9 @@ async def _run_apify_scraper_resilient(
                 status_data = status_resp.json().get("data", {})
                 final_status = status_data.get("status", "UNKNOWN")
                 status_message = status_data.get("statusMessage", "") or ""
-
                 print(f"[apify] Poll {attempt+1}/{MAX_POLL_ATTEMPTS}: {final_status}")
-
                 if final_status in TERMINAL_STATUSES:
                     break
-
             except Exception as e:
                 print(f"[apify] Poll error (continuing): {e}")
                 continue
@@ -465,6 +469,9 @@ async def _run_apify_scraper_resilient(
             raw_places = []
             status_message += f" | dataset fetch error: {e}"
 
+    # ── Save to disk immediately — before returning to caller, before any DB work ──
+    snapshot_path = _save_raw_snapshot(raw_places, run_id) if raw_places else ""
+
     run_info = {
         "status":     final_status,
         "is_partial": is_partial,
@@ -476,5 +483,4 @@ async def _run_apify_scraper_resilient(
     }
 
     print(f"[apify] Recovered {len(raw_places)} places (partial={is_partial})")
-    return raw_places, run_info
-
+    return raw_places, run_info, snapshot_path
