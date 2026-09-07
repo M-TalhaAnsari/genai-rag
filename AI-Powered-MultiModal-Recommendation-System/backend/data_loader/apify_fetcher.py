@@ -8,7 +8,9 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from urllib.parse import quote, urlencode
 from sqlalchemy.ext.asyncio import AsyncSession
 from backend.models.db_models import Restaurant
-
+import json
+from backend.models.db_models import ApifyRawSnapshot
+from backend.models.db_models import ApifyRunLog
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -20,7 +22,6 @@ from backend.core.database import AsyncSessionLocal
 
 from sqlalchemy import select
 
-load_dotenv()
 
 
 APIFY_ACTOR_ID = "compass~crawler-google-places"
@@ -363,48 +364,81 @@ TARGET_COUNTRY_CODE = "PK"   # was lowercase "pk" — keep consistent with post-
 
 DATA_DIR = "data/apify_raw"
 
+async def _save_raw_snapshot(raw_places: list[dict], run_id: str) -> int:
+    async with AsyncSessionLocal() as db:
+        snapshot = ApifyRawSnapshot(
+            run_id=run_id,
+            raw_json=json.dumps(raw_places, ensure_ascii=False),
+            place_count=len(raw_places),
+            processed=False,
+        )
+        db.add(snapshot)
+        await db.commit()
+        await db.refresh(snapshot)
+        return snapshot.id
 
-def _save_raw_snapshot(raw_places: list[dict], run_id: str) -> str:
-    """
-    Persist the raw Apify response to disk BEFORE any DB/embedding work touches it.
-    If the DB pipeline crashes afterward, you re-run from this file — zero Apify
-    credits wasted, because the expensive part (the actor run) already happened
-    and its output is safe on disk.
-    """
-    import json
-    from datetime import datetime, timezone
 
-    os.makedirs(DATA_DIR, exist_ok=True)
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = f"{DATA_DIR}/run_{run_id}_{ts}.json"
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(raw_places, f, ensure_ascii=False)
-    print(f"[apify] Raw snapshot saved: {path} ({len(raw_places)} places)")
-    return path
+async def _mark_snapshot_processed(snapshot_id: int) -> None:
+    from sqlalchemy import update
+    from backend.models.db_models import ApifyRawSnapshot
+
+    async with AsyncSessionLocal() as db:
+        await db.execute(
+            update(ApifyRawSnapshot)
+            .where(ApifyRawSnapshot.id == snapshot_id)
+            .values(processed=True)
+        )
+        await db.commit()
+
+
+async def _log_run(
+    run_id: str,
+    search_terms: list[str],
+    per_city_limit: int,
+    places_fetched: int,
+    new_inserted: int,
+    duplicates: int,
+    is_partial: bool,
+) -> None:
+
+    async with AsyncSessionLocal() as db:
+        db.add(ApifyRunLog(
+            run_id=run_id,
+            search_terms=json.dumps(search_terms),
+            per_city_limit=per_city_limit,
+            places_fetched=places_fetched,
+            new_inserted=new_inserted,
+            duplicates=duplicates,
+            is_partial=is_partial,
+        ))
+        await db.commit()
 
 
 async def _run_apify_scraper_resilient(
-    cities: list[str],
+    search_terms: list[str],
     per_city_limit: int,
     max_reviews: int = 5,
     max_images: int = 3,
-) -> tuple[list[dict], dict, str]:
+) -> tuple[list[dict], dict, int, str]:
     """
-    Returns (raw_places, run_info, snapshot_path) — snapshot_path is the on-disk
-    copy, so callers always have a fallback file to reload from if downstream
-    processing fails.
+    Runs the Apify actor with the given search terms, polls to completion
+    or timeout, fetches the dataset regardless of final status, and saves
+    a raw snapshot to Neon before returning.
+
+    Returns:
+        (raw_places, run_info, snapshot_id, run_id)
     """
     token = _get_apify_token()
-    search_terms = [f"restaurants in {city} Pakistan" for city in cities]
 
     actor_input = {
         "searchStringsArray":        search_terms,
         "maxCrawledPlacesPerSearch": per_city_limit,
         "language":                  "en",
         "countryCode":               TARGET_COUNTRY_CODE,
-        "maxReviews":                max_reviews,     # ← was missing entirely
-        "maxImages":                 max_images,       # ← was missing entirely
-        "scrapeReviewsPersonalData": False,             # reviewer PII not needed, cheaper
+        "maxReviews":                max_reviews,
+        "maxImages":                 max_images,
+        "reviewsSort":               "newest",
+        "scrapeReviewsPersonalData": False,
         "exportPlaceUrls":           False,
         "skipClosedPlaces":          True,
     }
@@ -434,6 +468,7 @@ async def _run_apify_scraper_resilient(
             )
 
         print(f"[apify] Run started: {run_id} (dataset: {dataset_id})")
+
         final_status = "UNKNOWN"
         status_message = ""
 
@@ -469,8 +504,7 @@ async def _run_apify_scraper_resilient(
             raw_places = []
             status_message += f" | dataset fetch error: {e}"
 
-    # ── Save to disk immediately — before returning to caller, before any DB work ──
-    snapshot_path = _save_raw_snapshot(raw_places, run_id) if raw_places else ""
+    snapshot_id = await _save_raw_snapshot(raw_places, run_id) if raw_places else 0
 
     run_info = {
         "status":     final_status,
@@ -482,5 +516,5 @@ async def _run_apify_scraper_resilient(
         )
     }
 
-    print(f"[apify] Recovered {len(raw_places)} places (partial={is_partial})")
-    return raw_places, run_info, snapshot_path
+    print(f"[apify] Recovered {len(raw_places)} places (partial={is_partial}), snapshot_id={snapshot_id}")
+    return raw_places, run_info, snapshot_id, run_id

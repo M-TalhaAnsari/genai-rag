@@ -231,21 +231,33 @@ async def summarise_all_reviews(db: AsyncSession = Depends(get_db)):
 
 
 # ── n8n automated Apify sync ───────────────────────────────────────────────
-
 @router.post("/n8n/sync-apify", dependencies=[Depends(require_admin)])
 async def n8n_sync_apify(
     cities: str | None = Query(default=None),
-    per_city_limit: int = Query(default=5, description="Keep small on a tight budget — test before scaling"),
+    per_city_limit: int = Query(default=5, description="Keep small until you've verified output"),
+    search_mode: str = Query(
+        default="broad",
+        description="broad | cafes | cuisine-specific — vary this across runs to avoid re-scraping the same top results"
+    ),
     max_reviews: int = Query(default=5),
     max_images: int = Query(default=3),
 ):
+    from backend.apify_automation import _log_run, _mark_snapshot_processed
+
     city_list = (
         [c.strip() for c in cities.split(",") if c.strip()]
         if cities else ["Lahore", "Islamabad", "Karachi", "Rawalpindi"]
     )
 
-    raw_places, run_info, snapshot_path = await _run_apify_scraper_resilient(
-        city_list, per_city_limit, max_reviews=max_reviews, max_images=max_images
+    if search_mode == "cafes":
+        search_terms = [f"cafes in {city} Pakistan" for city in city_list]
+    elif search_mode == "fastfood":
+        search_terms = [f"fast food in {city} Pakistan" for city in city_list]
+    else:
+        search_terms = [f"restaurants in {city} Pakistan" for city in city_list]
+
+    raw_places, run_info, snapshot_id, run_id = await _run_apify_scraper_resilient(
+        search_terms, per_city_limit, max_reviews=max_reviews, max_images=max_images
     )
 
     if not raw_places:
@@ -253,7 +265,7 @@ async def n8n_sync_apify(
             "message":     "No places recovered from Apify.",
             "run_status":  run_info["status"],
             "run_message": run_info["message"],
-            "cities":      city_list,
+            "search_terms": search_terms,
             "inserted":    0,
             "skipped":     0,
         }
@@ -261,22 +273,33 @@ async def n8n_sync_apify(
     try:
         result = await _load_places(raw_places)
     except Exception as e:
-        # Data is already safe on disk — nothing lost, just retry the DB step.
         return {
             "message": (
-                "Apify fetch succeeded and was saved to disk, but the database "
-                "step failed. No Apify credits were wasted — retry by pointing "
-                "/ingestion/load-apify at this file."
+                "Apify fetch succeeded and was saved to Neon (snapshot table), "
+                "but the DB load step failed. No Apify credits were wasted — "
+                "reprocess by pointing a retry at this snapshot_id."
             ),
-            "snapshot_path": snapshot_path,
+            "snapshot_id": snapshot_id,
             "error": str(e),
             "raw_places_fetched": len(raw_places),
         }
+
+    await _mark_snapshot_processed(snapshot_id)
 
     total_processed = result["inserted"] + result["skipped"]
     duplicate_ratio = (
         round(result["skipped"] / total_processed * 100, 1)
         if total_processed > 0 else 0.0
+    )
+
+    await _log_run(
+        run_id=run_id,
+        search_terms=search_terms,
+        per_city_limit=per_city_limit,
+        places_fetched=len(raw_places),
+        new_inserted=result["inserted"],
+        duplicates=result["skipped"],
+        is_partial=run_info["is_partial"],
     )
 
     return {
@@ -287,12 +310,40 @@ async def n8n_sync_apify(
         "run_status":             run_info["status"],
         "is_partial":             run_info["is_partial"],
         "run_message":            run_info["message"],
-        "cities":                 city_list,
-        "snapshot_path":          snapshot_path,
+        "search_terms":           search_terms,
+        "snapshot_id":            snapshot_id,
         "raw_places_fetched":     len(raw_places),
         "new_vs_duplicate_ratio": f"{duplicate_ratio}% already in database",
         **result,
     }
+
+
+@router.get("/n8n/run-history", dependencies=[Depends(require_admin)])
+async def apify_run_history(db: AsyncSession = Depends(get_db)):
+    """
+    Check past runs before deciding to spend more Apify credits.
+    High duplicate counts on a search term = don't repeat it, vary the query.
+    """
+    from backend.models.db_models import ApifyRunLog
+
+    result = await db.execute(
+        select(ApifyRunLog).order_by(ApifyRunLog.created_at.desc()).limit(20)
+    )
+    logs = result.scalars().all()
+
+    return [
+        {
+            "run_id":         l.run_id,
+            "search_terms":   l.search_terms,
+            "per_city_limit": l.per_city_limit,
+            "places_fetched": l.places_fetched,
+            "new_inserted":   l.new_inserted,
+            "duplicates":     l.duplicates,
+            "is_partial":     l.is_partial,
+            "created_at":     l.created_at.isoformat() if l.created_at else None,
+        }
+        for l in logs
+    ]
 
 
 @router.get("/n8n/apify-status", dependencies=[Depends(require_admin)])

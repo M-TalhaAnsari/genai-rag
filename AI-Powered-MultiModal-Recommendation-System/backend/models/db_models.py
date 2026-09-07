@@ -197,3 +197,26 @@ class RefreshToken(Base):
 
     user = relationship("User", back_populates="refresh_tokens")
 
+class ApifyRawSnapshot(Base):
+    __tablename__ = "apify_raw_snapshots"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    run_id      = Column(String, nullable=False, index=True)
+    raw_json    = Column(Text, nullable=False)       # json.dumps(raw_places)
+    place_count = Column(Integer, nullable=False)
+    processed   = Column(Boolean, default=False, nullable=False)
+    created_at  = Column(DateTime, server_default=func.now())
+
+
+class ApifyRunLog(Base):
+    __tablename__ = "apify_run_logs"
+
+    id             = Column(Integer, primary_key=True, index=True)
+    run_id         = Column(String, nullable=False)
+    search_terms   = Column(Text, nullable=False)    # JSON list
+    per_city_limit = Column(Integer, nullable=False)
+    places_fetched = Column(Integer, nullable=False)
+    new_inserted   = Column(Integer, nullable=False)
+    duplicates     = Column(Integer, nullable=False)
+    is_partial     = Column(Boolean, default=False, nullable=False)
+    created_at     = Column(DateTime, server_default=func.now())

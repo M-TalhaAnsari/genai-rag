@@ -240,8 +240,6 @@ async def load_apify_export(filepath: str = APIFY_EXPORT_PATH) -> dict:
         return {"error": "Expected a JSON array at the top level of the Apify export."}
 
     return await _load_places(raw_data)
-
-
 async def _load_places(raw_data: list[dict]) -> dict:
     """Shared loading logic — used by both manual file load and automated API load."""
     print(f"[apify] Processing {len(raw_data)} places")
@@ -265,13 +263,18 @@ async def _load_places(raw_data: list[dict]) -> dict:
 
             try:
                 restaurant_data, reviews = normalize_apify_place(place)
-                name = restaurant_data.get("name", "").strip()
-                external_id = restaurant_data.get("external_id")
+            except Exception as e:
+                errors.append(f"normalise error ({place.get('title', '?')}): {e}")
+                continue
 
-                if not name:
-                    skipped += 1
-                    continue
+            name = restaurant_data.get("name", "").strip()
+            external_id = restaurant_data.get("external_id")
 
+            if not name:
+                skipped += 1
+                continue
+
+            try:
                 if external_id:
                     result = await db.execute(
                         select(Restaurant).where(Restaurant.external_id == external_id)
@@ -294,12 +297,11 @@ async def _load_places(raw_data: list[dict]) -> dict:
                 inserted += 1
 
             except Exception as e:
-                errors.append(f"place error ({place.get('title', '?')}): {e}")
+                errors.append(f"insert error ({name}): {e}")
                 continue
 
         await db.commit()
 
-        # Refresh, insert reviews, embed
         for record, reviews in newly_inserted:
             await db.refresh(record)
 
@@ -330,7 +332,6 @@ async def _load_places(raw_data: list[dict]) -> dict:
 
         await db.commit()
 
-        # Rebuild BM25 from full table
         all_result = await db.execute(select(Restaurant))
         all_restaurants = all_result.scalars().all()
         bm25_store.build_index([
@@ -338,35 +339,9 @@ async def _load_places(raw_data: list[dict]) -> dict:
             for r in all_restaurants
         ])
 
-        # Auto-summarise reviews for newly inserted restaurants that have them
-        summarised = 0
-        if newly_inserted:
-            from backend.data_loader.review_summariser import summarise_reviews
-            from backend.retrieving.vector_store import upsert_review_summary
-
-            for record, reviews in newly_inserted:
-                if not reviews:
-                    continue
-                try:
-                    summary_data = summarise_reviews(
-                        restaurant_name=record.name,
-                        cuisine=record.cuisine,
-                        reviews=reviews
-                    )
-                    upsert_review_summary(
-                        restaurant_id=record.id,
-                        restaurant_name=record.name,
-                        cuisine=record.cuisine,
-                        city=record.city,
-                        **summary_data
-                    )
-                    summarised += 1
-                except Exception as e:
-                    errors.append(f"summarise {record.name}: {e}")
-
     print(f"[apify] Done: {inserted} inserted, {skipped} skipped, "
           f"{skipped_wrong_country} wrong-country rejected, "
-          f"{reviews_inserted} reviews, {embedded} embedded, {summarised} summarised")
+          f"{reviews_inserted} reviews, {embedded} embedded")
 
     return {
         "inserted":               inserted,
@@ -374,11 +349,8 @@ async def _load_places(raw_data: list[dict]) -> dict:
         "skipped_wrong_country":  skipped_wrong_country,
         "reviews_inserted":       reviews_inserted,
         "embedded":               embedded,
-        "reviews_summarised":     summarised,
         "errors":                 errors[:10],
     }
-
-
 # ── CLI entry point ────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
