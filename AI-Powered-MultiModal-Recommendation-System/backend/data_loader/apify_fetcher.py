@@ -11,6 +11,8 @@ from backend.models.db_models import Restaurant
 import json
 from backend.models.db_models import ApifyRawSnapshot
 from backend.models.db_models import ApifyRunLog
+from backend.data_loader.apify_loader import normalize_apify_place
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -341,6 +343,58 @@ def _get_apify_token() -> str:
 
 # ── Internal helper ────────────────────────────────────────────────────────
 
+async def _run_apify_targeted_by_place_ids(
+    place_ids: list[str],
+    max_reviews: int = 5,
+    max_images: int = 3,
+) -> tuple[list[dict], dict, int, str]:
+    """
+    Scrapes specific known places directly by Google placeId — no search
+    phase, no risk of rediscovering restaurants you already have as 'new'.
+    Only pulls the detail pass (reviews, photos, hours) for places you
+    already identified as incomplete.
+    """
+    token = _get_apify_token()
+
+    actor_input = {
+        "placeIds":                  place_ids,   # direct lookup, not search
+        "maxReviews":                max_reviews,
+        "maxImages":                 max_images,
+        "reviewsSort":               "newest",
+        "scrapeReviewsPersonalData": False,
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        start_resp = await client.post(
+            APIFY_START_RUN_URL, params={"token": token}, json=actor_input
+        )
+        start_resp.raise_for_status()
+        run_data   = start_resp.json().get("data", {})
+        run_id     = run_data.get("id")
+        dataset_id = run_data.get("defaultDatasetId")
+
+        final_status = "UNKNOWN"
+        for attempt in range(MAX_POLL_ATTEMPTS):
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+            status_resp = await client.get(
+                APIFY_RUN_STATUS_URL.format(run_id=run_id), params={"token": token}
+            )
+            status_data = status_resp.json().get("data", {})
+            final_status = status_data.get("status", "UNKNOWN")
+            if final_status in TERMINAL_STATUSES:
+                break
+
+        is_partial = final_status != "SUCCEEDED"
+        items_resp = await client.get(
+            APIFY_DATASET_ITEMS_URL.format(dataset_id=dataset_id),
+            params={"token": token, "clean": "true"}, timeout=60.0
+        )
+        raw_places = items_resp.json()
+
+    snapshot_id = await _save_raw_snapshot(raw_places, run_id) if raw_places else 0
+    run_info = {"status": final_status, "is_partial": is_partial, "message": ""}
+    return raw_places, run_info, snapshot_id, run_id
+
 async def _get_restaurant_contact_method(restaurant_id: int) -> dict:
     """
     Look up a restaurant's available contact channels and return
@@ -358,6 +412,53 @@ async def _get_restaurant_contact_method(restaurant_id: int) -> dict:
         "website":r.get("website",None),
     }
 
+async def _merge_enrichment_into_existing(raw_places: list[dict]) -> dict:
+
+    updated, reviews_added, errors = 0, 0, []
+
+    async with AsyncSessionLocal() as db:
+        for place in raw_places:
+            try:
+                restaurant_data, reviews = normalize_apify_place(place)
+                external_id = restaurant_data.get("external_id")
+                if not external_id:
+                    continue
+
+                result = await db.execute(
+                    select(Restaurant).where(Restaurant.external_id == external_id)
+                )
+                existing = result.scalars().first()
+                if not existing:
+                    continue   # not one of ours — ignore, don't insert new rows here
+
+                if restaurant_data.get("photos"):
+                    existing.photos = restaurant_data["photos"]
+                if restaurant_data.get("opening_hours"):
+                    existing.opening_hours = restaurant_data["opening_hours"]
+                if restaurant_data.get("review_count"):
+                    existing.review_count = restaurant_data["review_count"]
+                if restaurant_data.get("rating"):
+                    existing.rating = restaurant_data["rating"]
+
+                for rv in reviews:
+                    existing_rv = await db.execute(
+                        select(Review).where(
+                            Review.restaurant_id == existing.id,
+                            Review.text == rv.get("text"),
+                        )
+                    )
+                    if existing_rv.scalars().first():
+                        continue
+                    db.add(Review(restaurant_id=existing.id, **rv))
+                    reviews_added += 1
+
+                updated += 1
+            except Exception as e:
+                errors.append(f"{place.get('title', '?')}: {e}")
+
+        await db.commit()
+
+    return {"updated": updated, "reviews_added": reviews_added, "errors": errors[:10]}
 
 # ── Apify API call ──────────────────────────────────────────────────────────
 TARGET_COUNTRY_CODE = "PK"   # was lowercase "pk" — keep consistent with post-filter check

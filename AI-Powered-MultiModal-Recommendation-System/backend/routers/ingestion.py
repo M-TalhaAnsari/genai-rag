@@ -31,7 +31,10 @@ from backend.data_loader.restaurant_fetcher import fetch_all_cities, TARGET_CITI
 from backend.data_loader.apify_loader import load_apify_export, _load_places
 from backend.data_loader.review_summariser import summarise_reviews as _summarise
 
-from backend.data_loader.apify_fetcher import _run_apify_scraper_resilient
+from backend.data_loader.apify_fetcher import (_run_apify_scraper_resilient,_log_run, 
+                                               _mark_snapshot_processed, 
+                                               _merge_enrichment_into_existing, 
+                                               _run_apify_targeted_by_place_ids)
 
 from backend.services.enrichment_services import enrich_restaurants
 
@@ -242,8 +245,6 @@ async def n8n_sync_apify(
     max_reviews: int = Query(default=5),
     max_images: int = Query(default=3),
 ):
-    from backend.apify_automation import _log_run, _mark_snapshot_processed
-
     city_list = (
         [c.strip() for c in cities.split(",") if c.strip()]
         if cities else ["Lahore", "Islamabad", "Karachi", "Rawalpindi"]
@@ -367,7 +368,57 @@ async def n8n_apify_status(db: AsyncSession = Depends(get_db)):
         "bm25_index_exists": bm25_store.index_exists(),
     }
 
+@router.get("/restaurants-missing-data", dependencies=[Depends(require_admin)])
+async def restaurants_missing_data(
+    limit: int = Query(default=50),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Restaurants that have an external_id (Google placeId) but no reviews
+    and/or no photos — candidates for a targeted re-scrape.
+    """
+    result = await db.execute(
+        select(Restaurant).where(Restaurant.external_id.isnot(None))
+    )
+    all_r = result.scalars().all()
 
+    missing = [
+        r for r in all_r
+        if not r.photos or r.review_count is None or r.review_count == 0
+    ]
+
+    return {
+        "total_with_placeid": len(all_r),
+        "missing_reviews_or_photos": len(missing),
+        "sample_place_ids": [r.external_id for r in missing[:limit]],
+    }
+
+@router.post("/enrich-existing-via-apify", dependencies=[Depends(require_admin)])
+async def enrich_existing_via_apify(
+    limit: int = Query(default=20, description="How many incomplete restaurants to target this run"),
+    db: AsyncSession = Depends(get_db)
+):
+    result = await db.execute(
+        select(Restaurant).where(Restaurant.external_id.isnot(None))
+    )
+    all_r = result.scalars().all()
+    targets = [
+        r.external_id for r in all_r
+        if (not r.photos or not r.review_count) 
+    ][:limit]
+
+    if not targets:
+        return {"message": "Nothing to enrich — all restaurants already have reviews/photos."}
+
+    raw_places, run_info, snapshot_id, run_id = await _run_apify_targeted_by_place_ids(targets)
+    merge_result = await _merge_enrichment_into_existing(raw_places)
+
+    return {
+        "targeted_place_ids": len(targets),
+        "run_status": run_info["status"],
+        "snapshot_id": snapshot_id,
+        **merge_result,
+    }
 # ── Google Places enrichment ───────────────────────────────────────────────
 
 @router.post("/enrich-reviews",  dependencies=[Depends(require_admin)])
