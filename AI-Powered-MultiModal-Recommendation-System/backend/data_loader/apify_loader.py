@@ -19,6 +19,63 @@ APIFY_EXPORT_PATH = "data/apify_export.json"
 
 # ── Field extraction helpers ────────────────────────────────────────────────
 
+# backend/apify_automation.py — add near the top
+
+CUISINE_KEYWORDS = [
+    "biryani", "BBQ", "Chinese", "fast food", "Italian",
+    "seafood", "desi", "karahi", "continental", "Thai",
+]
+
+NEIGHBORHOODS = {
+    "Lahore":     ["DHA", "Gulberg", "Johar Town", "Model Town", "Bahria Town"],
+    "Islamabad":  ["F-7", "F-6", "F-10", "Blue Area", "G-9"],
+    "Karachi":    ["Clifton", "DHA", "Gulshan-e-Iqbal", "Saddar", "North Nazimabad"],
+    "Rawalpindi": ["Saddar", "Bahria Town", "Chaklala", "Satellite Town"],
+}
+
+
+def build_search_terms(
+    cities: list[str],
+    mode: str = "broad",
+) -> list[str]:
+    """
+    Generates search terms for a given mode — no manual editing needed
+    per run. Modes:
+      broad             — "restaurants in {city} Pakistan" (default, most saturated after repeated use)
+      cafes             — "cafes in {city} Pakistan"
+      fastfood          — "fast food in {city} Pakistan"
+      bakeries          — "bakeries in {city} Pakistan"
+      cuisine-specific  — one term per cuisine keyword, per city
+      neighborhood      — one term per known neighborhood, per city (highest yield for new places)
+    """
+    if mode == "broad":
+        return [f"restaurants in {c} Pakistan" for c in cities]
+
+    if mode == "cafes":
+        return [f"cafes in {c} Pakistan" for c in cities]
+
+    if mode == "fastfood":
+        return [f"fast food in {c} Pakistan" for c in cities]
+
+    if mode == "bakeries":
+        return [f"bakeries in {c} Pakistan" for c in cities]
+
+    if mode == "cuisine-specific":
+        terms = []
+        for city in cities:
+            for cuisine in CUISINE_KEYWORDS:
+                terms.append(f"{cuisine} restaurants in {city} Pakistan")
+        return terms
+
+    if mode == "neighborhood":
+        terms = []
+        for city in cities:
+            for area in NEIGHBORHOODS.get(city, []):
+                terms.append(f"restaurants in {area} {city} Pakistan")
+        return terms
+
+    raise ValueError(f"Unknown search_mode: {mode}")
+
 def _extract_price_level(price_raw) -> str | None:
     """Convert Apify price field to $ symbols. Handles int, string, or None."""
     if price_raw is None:
@@ -351,6 +408,138 @@ async def _load_places(raw_data: list[dict]) -> dict:
         "embedded":               embedded,
         "errors":                 errors[:10],
     }
+
+BATCH_SIZE = 25
+
+async def _load_places_fill_missing(raw_data: list[dict]) -> dict:
+    """
+    Batched version — processes places in chunks of BATCH_SIZE, each in
+    its own short-lived session. A connection drop mid-run only affects
+    the current batch; everything committed in prior batches is safe
+    regardless of what happens after.
+    """
+    print(f"[apify] Processing {len(raw_data)} places (fill-missing, batched)")
+
+    totals = {
+        "inserted": 0, "filled_existing": 0, "skipped_already_complete": 0,
+        "skipped_wrong_country": 0, "reviews_added": 0, "errors": []
+    }
+
+    FILLABLE_FIELDS = [
+        "area", "postal_code", "address", "phone", "website", "menu_url",
+        "rating", "review_count", "price_level", "reviews_distribution",
+        "description", "opening_hours", "photos", "tags", "all_cuisines",
+    ]
+
+    batches = [raw_data[i:i + BATCH_SIZE] for i in range(0, len(raw_data), BATCH_SIZE)]
+
+    for batch_num, batch in enumerate(batches, 1):
+        print(f"[apify] Batch {batch_num}/{len(batches)} ({len(batch)} places)")
+
+        async with AsyncSessionLocal() as db:
+            newly_inserted: list[tuple[Restaurant, list[dict]]] = []
+
+            for place in batch:
+                if place.get("permanentlyClosed") or place.get("temporarilyClosed"):
+                    totals["skipped_already_complete"] += 0
+                    continue
+
+                country_code = place.get("countryCode")
+                if country_code and country_code != "PK":
+                    totals["skipped_wrong_country"] += 1
+                    continue
+
+                try:
+                    restaurant_data, reviews = normalize_apify_place(place)
+                except Exception as e:
+                    totals["errors"].append(f"normalise error ({place.get('title', '?')}): {e}")
+                    continue
+
+                name = restaurant_data.get("name", "").strip()
+                external_id = restaurant_data.get("external_id")
+                if not name:
+                    continue
+
+                try:
+                    if external_id:
+                        result = await db.execute(
+                            select(Restaurant).where(Restaurant.external_id == external_id)
+                        )
+                    else:
+                        result = await db.execute(
+                            select(Restaurant).where(
+                                Restaurant.name == name,
+                                Restaurant.city == restaurant_data.get("city", "")
+                            )
+                        )
+
+                    existing = result.scalars().first()
+
+                    if existing:
+                        needs_fill = False
+                        for field in FILLABLE_FIELDS:
+                            current_value = getattr(existing, field, None)
+                            is_empty = current_value is None or current_value == "" or current_value == "[]"
+                            new_value = restaurant_data.get(field)
+                            if is_empty and new_value not in (None, "", "[]"):
+                                setattr(existing, field, new_value)
+                                needs_fill = True
+
+                        existing_review_result = await db.execute(
+                            select(Review).where(Review.restaurant_id == existing.id)
+                        )
+                        has_reviews = existing_review_result.scalars().first() is not None
+
+                        if not has_reviews and reviews:
+                            for rv in reviews:
+                                db.add(Review(restaurant_id=existing.id, **rv))
+                                totals["reviews_added"] += 1
+                            needs_fill = True
+
+                        if needs_fill:
+                            totals["filled_existing"] += 1
+                        else:
+                            totals["skipped_already_complete"] += 1
+                        continue
+
+                    record = Restaurant(**restaurant_data, is_embedded=False)
+                    db.add(record)
+                    newly_inserted.append((record, reviews))
+                    totals["inserted"] += 1
+
+                except Exception as e:
+                    totals["errors"].append(f"process error ({name}): {e}")
+                    continue
+
+            await db.commit()
+
+            for record, reviews in newly_inserted:
+                await db.refresh(record)
+                for rv in reviews:
+                    db.add(Review(restaurant_id=record.id, **rv))
+                    totals["reviews_added"] += 1
+                try:
+                    vector_store.upsert_restaurant(
+                        restaurant_id=record.id,
+                        name=record.name, cuisine=record.cuisine, city=record.city,
+                        address=record.address, description=record.description,
+                        tags=record.tags, opening_hours=record.opening_hours,
+                        phone=record.phone, website=record.website,
+                        rating=record.rating, latitude=record.latitude, longitude=record.longitude,
+                    )
+                    record.is_embedded = True
+                except Exception as e:
+                    totals["errors"].append(f"embed {record.name}: {e}")
+
+            await db.commit()
+        # session closes here — short-lived, connection released before next batch
+
+    print(f"[apify] Fill-missing done: {totals['inserted']} new, "
+          f"{totals['filled_existing']} filled, {totals['reviews_added']} reviews added")
+
+    totals["errors"] = totals["errors"][:10]
+    return totals
+
 # ── CLI entry point ────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

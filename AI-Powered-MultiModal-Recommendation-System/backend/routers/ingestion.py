@@ -28,7 +28,9 @@ from backend.retrieving.vector_store import (review_collection_count,
                                             )
 
 from backend.data_loader.restaurant_fetcher import fetch_all_cities, TARGET_CITIES
-from backend.data_loader.apify_loader import load_apify_export, _load_places
+from backend.data_loader.apify_loader import load_apify_export, _load_places, _load_places_fill_missing
+from backend.data_loader.apify_loader import build_search_terms
+
 from backend.data_loader.review_summariser import summarise_reviews as _summarise
 
 from backend.data_loader.apify_fetcher import (_run_apify_scraper_resilient,_log_run, 
@@ -237,25 +239,24 @@ async def summarise_all_reviews(db: AsyncSession = Depends(get_db)):
 @router.post("/n8n/sync-apify", dependencies=[Depends(require_admin)])
 async def n8n_sync_apify(
     cities: str | None = Query(default=None),
-    per_city_limit: int = Query(default=5, description="Keep small until you've verified output"),
+    per_city_limit: int = Query(default=15),
     search_mode: str = Query(
         default="broad",
-        description="broad | cafes | cuisine-specific — vary this across runs to avoid re-scraping the same top results"
+        description="broad | cafes | fastfood | bakeries | cuisine-specific | neighborhood"
     ),
     max_reviews: int = Query(default=5),
     max_images: int = Query(default=3),
+    fill_missing: bool = Query(default=True),
 ):
     city_list = (
         [c.strip() for c in cities.split(",") if c.strip()]
         if cities else ["Lahore", "Islamabad", "Karachi", "Rawalpindi"]
     )
 
-    if search_mode == "cafes":
-        search_terms = [f"cafes in {city} Pakistan" for city in city_list]
-    elif search_mode == "fastfood":
-        search_terms = [f"fast food in {city} Pakistan" for city in city_list]
-    else:
-        search_terms = [f"restaurants in {city} Pakistan" for city in city_list]
+    try:
+        search_terms = build_search_terms(city_list, search_mode)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     raw_places, run_info, snapshot_id, run_id = await _run_apify_scraper_resilient(
         search_terms, per_city_limit, max_reviews=max_reviews, max_images=max_images
@@ -272,7 +273,10 @@ async def n8n_sync_apify(
         }
 
     try:
-        result = await _load_places(raw_places)
+        if fill_missing:
+            result = await _load_places_fill_missing(raw_places)
+        else:
+            result = await _load_places(raw_places)
     except Exception as e:
         return {
             "message": (
@@ -286,6 +290,14 @@ async def n8n_sync_apify(
         }
 
     await _mark_snapshot_processed(snapshot_id)
+
+    async with AsyncSessionLocal() as db:
+        all_result = await db.execute(select(Restaurant))
+        all_recs = all_result.scalars().all()
+        bm25_store.build_index([
+            {"id": r.id, "name": r.name, "cuisine": r.cuisine, "city": r.city}
+            for r in all_recs
+        ])
 
     total_processed = result["inserted"] + result["skipped"]
     duplicate_ratio = (

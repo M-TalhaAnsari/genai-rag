@@ -461,7 +461,7 @@ async def _merge_enrichment_into_existing(raw_places: list[dict]) -> dict:
     return {"updated": updated, "reviews_added": reviews_added, "errors": errors[:10]}
 
 # ── Apify API call ──────────────────────────────────────────────────────────
-TARGET_COUNTRY_CODE = "PK"   # was lowercase "pk" — keep consistent with post-filter check
+TARGET_COUNTRY_CODE = "pk"   # was lowercase "pk" — keep consistent with post-filter check
 
 DATA_DIR = "data/apify_raw"
 
@@ -555,7 +555,7 @@ async def _run_apify_scraper_resilient(
         except httpx.HTTPStatusError as e:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Apify failed to start run: {e.response.status_code} {e.response.text[:300]}"
+                detail=f"Apify failed to start run: {e.response.status_code} {e.response.text[:3000]}"
             )
 
         run_data   = start_resp.json().get("data", {})

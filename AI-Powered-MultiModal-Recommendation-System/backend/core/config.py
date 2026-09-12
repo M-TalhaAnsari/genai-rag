@@ -45,8 +45,10 @@ class Settings:
     SMTP_USER: str | None = None
     SMTP_PASSWORD: str | None = None
     SMTP_FROM: str = "noreply@connoisseur.app"
-
-
+    JWT_ACCESS_EXPIRE_MINUTES:str = os.environ.get("JWT_ACCESS_EXPIRE_MINUTES", "")
+    JWT_REFRESH_EXPIRE_DAYS:str = os.environ.get("JWT_REFRESH_EXPIRE_DAYS", "")
+    JWT_SECRET_KEY:str=os.environ.get("JWT_SECRET_KEY", "")
+    JWT_ALGORITHM : str ="HS256"
     BACKEND_URL: str = "http://localhost:8000"
 
 settings = Settings()

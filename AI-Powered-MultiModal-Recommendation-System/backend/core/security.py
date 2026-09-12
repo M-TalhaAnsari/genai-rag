@@ -56,7 +56,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 
 def create_access_token(user_id: UUID, role: str) -> str:
     expire = datetime.now(timezone.utc) + timedelta(
-        minutes=settings.JWT_ACCESS_EXPIRE_MINUTES
+        minutes=int(settings.JWT_ACCESS_EXPIRE_MINUTES)
     )
     payload = {
         "sub": str(user_id),
@@ -90,7 +90,7 @@ def decode_token(token: str) -> dict:
 def create_refresh_token(user_id: UUID) -> tuple[str, UUID, datetime]:
     jti = uuid4()
     expire = datetime.now(timezone.utc) + timedelta(
-        days=settings.JWT_REFRESH_EXPIRE_DAYS
+        days=int(settings.JWT_REFRESH_EXPIRE_DAYS)
     )
     payload = {
         "sub": str(user_id),
