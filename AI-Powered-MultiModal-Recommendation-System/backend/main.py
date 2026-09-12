@@ -20,6 +20,10 @@ from backend.routers.memory        import router as memory_router
 from backend.routers.analytics     import router as analytics_router
 from backend.routers.ingestion     import router as ingestion_router
 
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+security_scheme = HTTPBearer()
+
 from backend.routers import auth as auth_router
 
 
@@ -27,6 +31,7 @@ app = FastAPI(
     title=settings.APP_TITLE,
     description=settings.APP_DESCRIPTION,
     version=settings.APP_VERSION,
+    security_scheme=security_scheme,
     docs_url="/docs",
     redoc_url="/redoc",
 )
