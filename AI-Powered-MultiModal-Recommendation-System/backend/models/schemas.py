@@ -188,6 +188,7 @@ Additions to backend/models/schemas.py
 """
 
 from uuid import UUID
+from datetime import datetime
 from pydantic import BaseModel, EmailStr
 
 
@@ -205,6 +206,7 @@ class UserOut(BaseModel):
     id: UUID
     email: EmailStr
     role: str
+    totp_enabled: bool = False
 
     class Config:
         from_attributes = True  # pydantic v2 (was orm_mode in v1)
@@ -218,3 +220,61 @@ class TokenPair(BaseModel):
 
 class RefreshRequest(BaseModel):
     refresh_token: str
+
+
+# ── Security hardening additions ────────────────────────────────────────────
+
+class LoginResult(BaseModel):
+    """/auth/login's response shape. When the account has 2FA enabled,
+    only mfa_required + mfa_token come back — no tokens yet, the caller
+    must hit /auth/login/verify-2fa next. Otherwise access_token /
+    refresh_token are populated and mfa_required is False."""
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    token_type: str = "bearer"
+    mfa_required: bool = False
+    mfa_token: Optional[str] = None
+
+
+class MFALoginRequest(BaseModel):
+    mfa_token: str
+    code: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+
+
+class DeactivateAccountRequest(BaseModel):
+    password: Optional[str] = None  # omitted for google-only accounts with no password
+
+
+class SessionOut(BaseModel):
+    jti: UUID
+    created_at: datetime
+    expires_at: datetime
+    user_agent: Optional[str] = None
+    ip_address: Optional[str] = None
+    current: bool = False
+
+    class Config:
+        from_attributes = True
+
+
+class TOTPSetupResponse(BaseModel):
+    secret: str
+    otpauth_uri: str
+
+
+class TOTPCodeRequest(BaseModel):
+    code: str
+
+
+class TOTPDisableRequest(BaseModel):
+    password: Optional[str] = None
+    code: str

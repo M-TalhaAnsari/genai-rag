@@ -173,13 +173,15 @@ class User(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email = Column(String, unique=True, index=True, nullable=False)
-    hashed_password = Column(String, nullable=False)
+    hashed_password = Column(String, nullable=True)  # null for google-only accounts (see 0002_google_oauth)
     auth_provider = Column(String, default="local", nullable=False)  # "local" | "google" | "google_and_local"
     google_id = Column(String, unique=True, nullable=True, index=True)
     role = Column(Enum(UserRole), default=UserRole.user, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     email_verified = Column(Boolean, nullable=False, server_default="false")
+    totp_secret = Column(String, nullable=True)
+    totp_enabled = Column(Boolean, default=False, nullable=False, server_default="false")
     refresh_tokens = relationship(
         "RefreshToken", back_populates="user", cascade="all, delete-orphan"
     )
@@ -194,8 +196,31 @@ class RefreshToken(Base):
     expires_at = Column(DateTime(timezone=True), nullable=False)
     revoked = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    user_agent = Column(String, nullable=True)
+    ip_address = Column(String, nullable=True)
 
     user = relationship("User", back_populates="refresh_tokens")
+
+
+class AuditLog(Base):
+    """Append-only auth event trail — login/logout, failed logins,
+    password changes, account linking/deactivation, 2FA changes.
+    user_id is nullable because a failed login on an unknown email
+    still needs a row (the whole point is to see abuse attempts),
+    and email is kept alongside user_id since a user's email can
+    change under them later."""
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    email = Column(String, nullable=True)
+    event_type = Column(String, nullable=False, index=True)
+    ip_address = Column(String, nullable=True)
+    user_agent = Column(String, nullable=True)
+    detail = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
 
 class ApifyRawSnapshot(Base):
     __tablename__ = "apify_raw_snapshots"

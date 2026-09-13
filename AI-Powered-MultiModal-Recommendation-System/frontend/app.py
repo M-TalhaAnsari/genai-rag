@@ -1,11 +1,12 @@
 """
 frontend/app.py
 ----------------
-Streamlit frontend — four tabs:
+Streamlit frontend — gated by login_page.render_login(). Five tabs:
   🔍 Discover   — search + restaurant cards with clickable contact links
   👤 My Profile — preference profile from feedback history
   🧠 My Memory  — session + long-term conversation memory
   📊 Analytics  — search volume, top queries, cuisine stats
+  ⚙️ Account    — sessions, 2FA, deactivation, logout
 
 Contact links per card (shown only when data exists):
   📧 Email    → opens default email client with pre-filled message
@@ -18,10 +19,11 @@ Run:
 """
 
 import streamlit as st
-import requests
 import json
 
-API_BASE = "http://127.0.0.1:8000"
+from login_page import render_login
+from api_client import authed_request, logout as api_logout
+
 
 st.set_page_config(
     page_title="Connoisseur",
@@ -110,6 +112,16 @@ section[data-testid="stSidebar"] { background:#141414; border-right:1px solid #2
 """, unsafe_allow_html=True)
 
 
+# ── Auth gate ────────────────────────────────────────────────────────────────
+# Must come before any tab/sidebar content. render_login() handles its own
+# screens (login/register/Google, account-linking, 2FA, password reset) and
+# returns False (having already rendered something) until the user is
+# actually signed in.
+
+if not render_login():
+    st.stop()
+
+
 # ── Session state ────────────────────────────────────────────────────────────
 
 def _init():
@@ -126,12 +138,35 @@ def _init():
 
 _init()
 
+# The authenticated identity, fetched once per script run and reused by
+# the sidebar and the Account tab below — avoids calling /auth/me twice.
+# Every other API call in this file already guards against a network
+# failure with try/except; this one is no exception (a backend hiccup
+# for an already-logged-in user should degrade gracefully, not crash
+# the whole page).
+try:
+    _me_resp = authed_request("GET", "/auth/me")
+    current_user = _me_resp.json() if _me_resp.status_code == 200 else {}
+except Exception:
+    current_user = {}
+current_email = current_user.get("email", "")
+
+# user_id/user_name predate real auth and are what /profile, /memory and
+# /feedback are keyed on — previously a free-typed, unverified string.
+# Default them to the real signed-in identity now that one exists; still
+# editable below for anyone who wants a separate personalization profile
+# from their login email.
+if not st.session_state.user_id:
+    st.session_state.user_id = current_email
+if not st.session_state.user_name and current_email:
+    st.session_state.user_name = current_email.split("@")[0]
+
 
 # ── API helpers ──────────────────────────────────────────────────────────────
 
 def _get(path, **params):
     try:
-        r = requests.get(f"{API_BASE}{path}", params=params, timeout=10)
+        r = authed_request("GET", path, params=params, timeout=10)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -141,7 +176,7 @@ def _get(path, **params):
 
 def _post(path, payload):
     try:
-        r = requests.post(f"{API_BASE}{path}", json=payload, timeout=60)
+        r = authed_request("POST", path, json=payload, timeout=60)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -160,8 +195,8 @@ def api_recommend(q, user_id):
     """Call /recommend SSE stream and return final recommendations."""
     try:
         payload = {"query": q, "user_id": user_id or None, "top_k": 5}
-        with requests.post(f"{API_BASE}/recommend", json=payload,
-                           stream=True, timeout=90) as r:
+        with authed_request("POST", "/recommend", json=payload,
+                             stream=True, timeout=90) as r:
             r.raise_for_status()
             for line in r.iter_lines():
                 if not line:
@@ -187,8 +222,7 @@ def api_contact_links(restaurant_id, user_name, user_query):
 
 def api_review_summary(restaurant_id):
     try:
-        r = requests.get(f"{API_BASE}/restaurants/{restaurant_id}/review-summary",
-                         timeout=5)
+        r = authed_request("GET", f"/restaurants/{restaurant_id}/review-summary", timeout=5)
         if r.status_code == 404:
             return {}
         r.raise_for_status()
@@ -213,7 +247,7 @@ def api_feedback(restaurant, signal, query, user_id):
 
 def api_profile(user_id):
     try:
-        r = requests.get(f"{API_BASE}/profile/{user_id}", timeout=5)
+        r = authed_request("GET", f"/profile/{user_id}", timeout=5)
         if r.status_code == 404:
             return {}
         r.raise_for_status()
@@ -224,7 +258,7 @@ def api_profile(user_id):
 
 def api_memory(user_id):
     try:
-        r = requests.get(f"{API_BASE}/memory/{user_id}", timeout=5)
+        r = authed_request("GET", f"/memory/{user_id}", timeout=5)
         r.raise_for_status()
         return r.json()
     except Exception:
@@ -357,6 +391,13 @@ with st.sidebar:
                 unsafe_allow_html=True)
     st.divider()
 
+    if current_email:
+        st.markdown(f"Signed in as **{current_email}**")
+    if st.button("Log out", key="sidebar_logout_btn", use_container_width=True):
+        api_logout()
+        st.rerun()
+    st.divider()
+
     st.markdown("**Your details**")
     name_val = st.text_input("Name", value=st.session_state.user_name,
                               placeholder="Ahmed", label_visibility="collapsed")
@@ -377,8 +418,8 @@ with st.sidebar:
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
 
-tab_search, tab_profile, tab_memory, tab_analytics = st.tabs([
-    "🔍 Discover", "👤 My Profile", "🧠 My Memory", "📊 Analytics"
+tab_search, tab_profile, tab_memory, tab_analytics, tab_account = st.tabs([
+    "🔍 Discover", "👤 My Profile", "🧠 My Memory", "📊 Analytics", "⚙️ Account"
 ])
 
 
@@ -662,3 +703,142 @@ with tab_analytics:
                     f"<span style='color:#555;'>× {item['count']}</span></p>",
                     unsafe_allow_html=True
                 )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 5 — ACCOUNT
+# ════════════════════════════════════════════════════════════════════════════
+
+try:
+    import qrcode
+    from io import BytesIO
+
+    def _totp_qr_png(uri: str) -> bytes:
+        buf = BytesIO()
+        qrcode.make(uri).save(buf, format="PNG")
+        return buf.getvalue()
+except ImportError:
+    qrcode = None  # falls back to manual-entry secret only, below
+
+
+def _safe_request(method, path, **kwargs):
+    """Every other API call in this file already guards against a
+    network failure with try/except — the Account tab below makes
+    several more calls than the rest of the file, so this centralizes
+    the same guard instead of repeating it at each call site."""
+    try:
+        return authed_request(method, path, **kwargs)
+    except Exception as e:
+        st.error(f"Network error: {e}")
+        return None
+
+
+with tab_account:
+    st.markdown("## Account")
+
+    if current_email:
+        st.write(f"Signed in as **{current_email}**")
+
+    st.divider()
+
+    # ── Sessions ──────────────────────────────────────────────────────────
+    st.markdown("### Sessions")
+    st.caption("Every device or browser currently signed in to your account.")
+
+    sess_resp = _safe_request("GET", "/auth/sessions")
+    if sess_resp is not None and sess_resp.status_code == 200:
+        sessions = sess_resp.json()
+        if not sessions:
+            st.caption("No active sessions found.")
+        for s in sessions:
+            label = s.get("user_agent") or "Unknown device"
+            if s.get("current"):
+                label = f"📍 This device — {label}"
+            col_a, col_b = st.columns([5, 1])
+            with col_a:
+                st.write(label)
+                st.caption(f"IP {s.get('ip_address') or 'unknown'} · signed in {str(s.get('created_at'))[:16]}")
+            with col_b:
+                if not s.get("current"):
+                    if st.button("Revoke", key=f"revoke_session_{s['jti']}"):
+                        _safe_request("DELETE", f"/auth/sessions/{s['jti']}")
+                        st.rerun()
+    elif sess_resp is not None:
+        st.caption("Couldn't load sessions right now.")
+
+    st.divider()
+
+    # ── Two-factor authentication ────────────────────────────────────────
+    st.markdown("### Two-factor authentication")
+
+    if not current_user.get("totp_enabled"):
+        st.write("Add an authenticator app (Google Authenticator, Authy, 1Password, etc.) as a second sign-in step.")
+
+        if "_totp_setup" not in st.session_state:
+            if st.button("Set up 2FA", key="start_2fa_setup"):
+                resp = _safe_request("POST", "/auth/2fa/setup")
+                if resp is not None and resp.status_code == 200:
+                    st.session_state["_totp_setup"] = resp.json()
+                    st.rerun()
+                elif resp is not None:
+                    st.error("Couldn't start 2FA setup.")
+        else:
+            setup_data = st.session_state["_totp_setup"]
+            st.write("Scan this in your authenticator app, or enter the secret manually:")
+            if qrcode is not None:
+                st.image(_totp_qr_png(setup_data["otpauth_uri"]), width=200)
+            else:
+                st.caption("Install the `qrcode` package to show a scannable code — manual entry works too:")
+            st.code(setup_data["secret"])
+
+            confirm_code = st.text_input("Enter the 6-digit code to confirm", key="totp_confirm_code", max_chars=6)
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Confirm and enable", key="totp_confirm_btn"):
+                    resp = _safe_request("POST", "/auth/2fa/verify", json={"code": confirm_code})
+                    if resp is not None and resp.status_code == 204:
+                        st.session_state.pop("_totp_setup", None)
+                        st.success("2FA enabled.")
+                        st.rerun()
+                    elif resp is not None:
+                        st.error(resp.json().get("detail", "Invalid code."))
+            with col2:
+                if st.button("Cancel", key="totp_setup_cancel_btn"):
+                    st.session_state.pop("_totp_setup", None)
+                    st.rerun()
+    else:
+        st.success("2FA is enabled on your account.")
+        with st.expander("Disable 2FA"):
+            disable_password = st.text_input(
+                "Password (leave blank for a Google-only account)",
+                type="password", key="disable_2fa_password",
+            )
+            disable_code = st.text_input("Current 2FA code", key="disable_2fa_code", max_chars=6)
+            if st.button("Disable 2FA", key="disable_2fa_btn"):
+                resp = _safe_request(
+                    "POST", "/auth/2fa/disable",
+                    json={"password": disable_password or None, "code": disable_code},
+                )
+                if resp is not None and resp.status_code == 204:
+                    st.success("2FA disabled.")
+                    st.rerun()
+                elif resp is not None:
+                    st.error(resp.json().get("detail", "Couldn't disable 2FA."))
+
+    st.divider()
+
+    # ── Deactivation ──────────────────────────────────────────────────────
+    st.markdown("### Deactivate account")
+    st.caption("Signs you out everywhere and deactivates your account.")
+    with st.expander("Deactivate my account"):
+        deactivate_password = st.text_input(
+            "Password (leave blank for a Google-only account)",
+            type="password", key="deactivate_password",
+        )
+        if st.button("Deactivate account", key="deactivate_btn"):
+            resp = _safe_request("POST", "/auth/deactivate", json={"password": deactivate_password or None})
+            if resp is not None and resp.status_code == 204:
+                api_logout()
+                st.rerun()
+            elif resp is not None:
+                st.error(resp.json().get("detail", "Couldn't deactivate account."))

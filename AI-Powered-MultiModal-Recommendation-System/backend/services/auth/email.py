@@ -35,9 +35,19 @@ def _send_raw(to_email: str, subject: str, body: str) -> None:
 
 
 def send_verification_email(to_email: str, token: str) -> None:
-    link = f"{settings.FRONTEND_URL}?verify_token={token}"
+    link = f"{settings.BACKEND_URL}/auth/verify-email?token={token}"
     _send_raw(
         to_email,
         "Verify your Connoisseur account",
         f"Click to verify your email (expires in 24 hours):\n\n{link}",
+    )
+
+
+def send_password_reset_email(to_email: str, token: str) -> None:
+    link = f"{settings.FRONTEND_URL}?reset_token={token}"
+    _send_raw(
+        to_email,
+        "Reset your Connoisseur password",
+        f"Click to choose a new password (expires in 30 minutes):\n\n{link}\n\n"
+        f"If you didn't request this, you can safely ignore this email.",
     )

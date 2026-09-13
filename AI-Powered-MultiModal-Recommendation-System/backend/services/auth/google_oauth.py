@@ -44,7 +44,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.core.config import settings
 from backend.core.redis_client import redis_client
 from backend.models.db_models import User, UserRole
-from backend.services.auth.core import AuthError
+from backend.services.auth.errors import AuthError
 
 GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
@@ -138,12 +138,10 @@ async def resolve_google_identity(db: AsyncSession, payload: dict) -> tuple[User
 
     Returns (None, pending) if this email already belongs to a LOCAL
     account that has never been linked to this Google identity. The
-    caller must NOT touch the DB in this case — the pending dict is
-    handed to create_link_token() so the frontend can collect the
-    account's password before we merge anything.
+    caller must NOT touch the DB in this case 
     """
     google_id = payload["sub"]
-    email = payload["email"]
+    email = payload["email"].strip().lower()
 
     result = await db.execute(select(User).where(User.google_id == google_id))
     user = result.scalar_one_or_none()
@@ -153,10 +151,7 @@ async def resolve_google_identity(db: AsyncSession, payload: dict) -> tuple[User
     result = await db.execute(select(User).where(User.email == email))
     existing = result.scalar_one_or_none()
     if existing:
-        # Do NOT set existing.google_id here. We don't yet know that
-        # whoever is sitting at this browser controls the existing
-        # account's password — only that Google says they control
-        # this email. Those are different claims.
+ 
         return None, {"google_id": google_id, "email": email}
 
     user = User(
