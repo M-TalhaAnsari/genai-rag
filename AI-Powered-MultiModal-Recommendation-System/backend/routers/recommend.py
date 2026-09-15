@@ -99,7 +99,7 @@ async def recommend(
             user_id=user_id
         )
 
-        yield f"data: {json.dumps({'event': 'result', 'query': request.query, 'user_id': user_id_str, 'personalised': profile is not None, 'result_count': len(recommendations), 'recommendations': recommendations, 'debug': {'profile_summary': result_state.get('profile_summary', ''), 'candidates_after_filter': len(result_state.get('filtered_candidates', []))}})}\n\n"
+        yield f"data: {json.dumps({'event': 'result', 'query': request.query, 'user_id': user_id_Str, 'personalised': profile is not None, 'result_count': len(recommendations), 'recommendations': recommendations, 'debug': {'profile_summary': result_state.get('profile_summary', ''), 'candidates_after_filter': len(result_state.get('filtered_candidates', []))}})}\n\n"
         yield f"data: {json.dumps({'event': 'done'})}\n\n"
  
     return StreamingResponse(
