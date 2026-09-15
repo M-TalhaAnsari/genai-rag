@@ -6,7 +6,7 @@ Production-grade AI backend for restaurant discovery across **Lahore, Islamabad,
 ## ScreenShot
 Frontend is in streamlit simple and easy to understand and navigate
 
-![alt text](image.png)
+![alt text](C:\BS -IT 1(A)\RAG\Intro To Rag\AI-Powered-MultiModal-Recommendation-System\image-1.png)
 ![alt text](image-1.png)
 ![alt text](image-2.png)
 ![alt text](image-3.png)
