@@ -9,8 +9,8 @@ Production-grade AI backend for restaurant discovery across **Lahore, Islamabad,
 Data ingestion                    Storage                      Retrieval
 ──────────────                    ───────                      ─────────
 Apify (bulk + backfill)   →      PostgreSQL (Neon)      →     BM25 (keyword)
-OSM + Foursquare (weekly) →      ChromaDB × 3:           →     Dense (identity)
-Google Places (fallback)  →        restaurants                Review sentiment
+OSM + Foursquare  →      ChromaDB × 3:           →     Dense (identity)
+Google Places   →        restaurants                Review sentiment
                                      restaurant_reviews          Image (CLIP)
                                      restaurant_images      →   RRF fusion
                                                                       │
@@ -25,7 +25,6 @@ Google Places (fallback)  →        restaurants                Review sentiment
                                                     Streamlit frontend (login-gated)
 ```
 
-**Image embedding is fully implemented**, not deferred — via two paths, both writing into the same `restaurant_images` ChromaDB collection using the same local CLIP model. See "Embedding reviews and images in batches" below.
 
 ---
 
@@ -320,12 +319,3 @@ Large ingestion runs can hold a DB session open long enough to hit Neon's idle-c
 | **CLIP image embedding** | — | Embeds URLs from any source above | ❌ No (local model) | Free — local compute only |
 
 ---
-
----
-
-## Where to go next
-
-- `CLAUDE.md` — architecture, data flow, agent workflow, golden rules for this codebase
-- `backend/services/auth/auth.md` — full auth design
-- `frontend/CLAUDE.md` — how the Streamlit app is wired to auth
-- `mcp_service/CLAUDE.md` — the standalone MCP server, optional to run
