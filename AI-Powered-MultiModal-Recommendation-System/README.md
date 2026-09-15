@@ -6,10 +6,10 @@ Production-grade AI backend for restaurant discovery across **Lahore, Islamabad,
 ## ScreenShot
 Frontend is in streamlit simple and easy to understand and navigate
 
-![alt text](image.png)
-![alt text](image-1.png)
-![alt text](image-2.png)
-![alt text](image-3.png)
+![alt text](assests\image.png)
+![alt text](assests\image-1.png)
+![alt text](assests\image-2.png)
+![alt text](assests\image-3.png)
 
 ## Architecture
 
