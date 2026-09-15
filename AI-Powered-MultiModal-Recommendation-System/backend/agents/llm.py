@@ -13,17 +13,17 @@ load_dotenv()
 
 # Initialise clients using environment variables
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # Map specific agents to preferred provider/model, or use defaults
 AGENT_MODEL_MAP = {
-    "profile_analyser": {"provider": "gemini", "model": "gemini-3.5-flash"},
+    "profile_analyser": {"provider": "gemini", "model": "gemini-3.6-flash"},
     "candidate_retriever": {"provider": "groq", "model": "llama-3.3-70b-versatile"},
-    "trend_analyst": {"provider": "gemini", "model": "gemini-3.5-flash"},
-    "style_expert": {"provider": "gemini", "model": "gemini-3.5-flash"},
+    "trend_analyst": {"provider": "gemini", "model": "gemini-3.6-flash"},
+    "style_expert": {"provider": "gemini", "model": "gemini-3.6-flash"},
     "nutrition_expert": {"provider": "groq", "model": "llama-3.3-70b-versatile"},
     "reranker": {"provider": "groq", "model": "llama-3.3-70b-versatile"},
 }
@@ -82,7 +82,7 @@ def call_agent(agent_name: str, message: str) -> str:
     if gemini_client:
         try:
             response = gemini_client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.6-flash",
                 contents=message
             )
             return response.text.strip()

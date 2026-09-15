@@ -73,7 +73,7 @@ async def recommend(
             None,
             lambda: run_recommendation_workflow(
                 query=request.query,
-                user_id=request.user_id or "anonymous",
+                user_id=user_id_Str or "anonymous",
                 profile=profile
             )
         )
