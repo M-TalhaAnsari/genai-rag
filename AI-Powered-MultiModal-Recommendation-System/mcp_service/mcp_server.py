@@ -36,7 +36,7 @@ from backend.core.database import AsyncSessionLocal, engine, Base
 from backend.services import feedback_service as feedback_module
 from backend.services import analytics_service as analytics_module
 from sqlalchemy import select
-from backend.models.schemas import Restaurant
+from backend.models.db_models import Restaurant
 
 # ── Server init ────────────────────────────────────────────────────────────
 

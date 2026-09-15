@@ -39,12 +39,11 @@ Required env var: GOOGLE_PLACES_API_KEY
 import asyncio
 import io
 import json
-import os
-
 import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.core.config import settings
 from backend.models.db_models import Restaurant, Review
 from backend.retrieving.vector_store import (
     upsert_review_summary,
@@ -62,7 +61,7 @@ MAX_PHOTOS         = 10     # images to embed per restaurant
 
 
 def _get_api_key() -> str:
-    key = os.environ.get("GOOGLE_PLACES_API_KEY", "").strip()
+    key = settings.GOOGLE_PLACES_API_KEY.strip()
     if not key:
         raise ValueError(
             "GOOGLE_PLACES_API_KEY not set. "

@@ -41,51 +41,88 @@ hallucination guardrails, credit-loss resilience).
 backend/
 ├── main.py                    # THIN — only creates app + mounts routers. Don't add logic here.
 ├── core/
-│   ├── config.py              # ALL env vars read here via `settings` object. Never os.environ directly elsewhere.
-│   └── database.py            # engine, AsyncSessionLocal, Base, get_db() dependency
+│   ├── config.py               # ALL env vars read here via `settings` object. Never os.environ directly elsewhere.
+│   ├── database.py              # engine, AsyncSessionLocal, Base, get_db() dependency
+│   ├── security.py              # JWT encode/decode, password hashing, get_current_user, require_admin/require_user
+│   └── redis_client.py          # one shared async Redis pool — sessions, rate limits, every short-lived token
 ├── models/
-│   ├── db_models.py           # SQLAlchemy tables — the single source of truth for schema
-│   └── schemas.py             # ALL Pydantic request/response models — one file, easy to find
-├── routers/                   # THIN layer — validate input, call services/, return response.
-│   │                           No business logic should live in a router.
-│   ├── restaurants.py         # reads: list, detail, reviews, review-summary, images
-│   ├── contact_links.py       # GET /restaurants/{id}/contact-links
-│   ├── search.py              # /search, /search/full, /search/by-review, /search/by-image
-│   ├── recommend.py           # POST /recommend — SSE stream wrapping the agent workflow
-│   ├── feedback.py            # POST /feedback, GET /profile/{user_id}
-│   ├── memory.py              # GET /memory/{user_id}
-│   ├── analytics.py           # GET /analytics, /vector-stats
-│   └── ingestion.py           # ALL write/sync endpoints, prefixed /ingestion — kept separate
-│                                 from read endpoints deliberately (candidate for auth later)
-├── services/                  # Business logic. No `from fastapi import ...` here — keep testable.
-│   ├── search_service.py      # hybrid_search / full_search / review_search
-│   ├── recommend_service.py   # thin async wrapper around agents/workflow.py
-│   ├── feedback_service.py    # save_feedback, recompute_profile, apply_profile_boost
-│   ├── memory_service.py      # short-term (RAM) + long-term (Postgres) memory
-│   ├── analytics_service.py   # search_logs / feedback aggregation queries
-│   ├── ingestion_service.py   # shared insert→embed→BM25 pipeline
-│   ├── contact_service.py     # mailto: / wa.me link generation — NO LLM, NO webhook
-│   └── enrichment_service.py  # Google Places review+photo enrichment, CLIP image embed
+│   ├── db_models.py             # SQLAlchemy tables — the single source of truth for schema
+│   └── schemas.py                # ALL Pydantic request/response models — one file, easy to find
+├── routers/                     # THIN layer — validate input, call services/, return response.
+│   │                              No business logic should live in a router.
+│   ├── restaurants.py            # reads: list, detail, reviews, review-summary, images
+│   ├── contact_links.py          # GET /restaurants/{id}/contact-links
+│   ├── search.py                 # /search, /search/full, /search/by-review, /search/by-image
+│   ├── recommend.py              # POST /recommend — SSE stream wrapping the agent workflow
+│   ├── feedback.py               # POST /feedback, GET /profile/{user_id}
+│   ├── memory.py                 # GET /memory/{user_id}
+│   ├── analytics.py              # GET /analytics, /vector-stats
+│   ├── ingestion.py              # ALL write/sync endpoints, prefixed /ingestion — kept separate
+│   │                                from read endpoints deliberately (this IS the auth boundary now:
+│   │                                every /ingestion/* route requires require_admin)
+│   └── auth/                     # split once auth crossed ~10 endpoints — see
+│       ├── __init__.py            #   backend/services/auth/CLAUDE.md for the full design
+│       ├── local.py               # register/login/verify-email/refresh/logout/me/deactivate/
+│       │                            sessions/2FA/password-reset — everything except Google
+│       ├── google.py              # Google OAuth (Authorization Code flow) + account linking
+│       └── auth.md                # session-by-session build notes — history, not current-state truth;
+│                                     read CLAUDE.md files for current state
+├── services/                     # Business logic. No `from fastapi import ...` here — keep testable.
+│   ├── search_service.py         # hybrid_search / full_search / review_search
+│   ├── recommend_service.py      # thin async wrapper around agents/workflow.py
+│   ├── feedback_service.py       # save_feedback, recompute_profile, apply_profile_boost
+│   ├── memory_service.py         # short-term (RAM) + long-term (Postgres) memory
+│   ├── analytics_service.py      # search_logs / feedback aggregation queries
+│   ├── ingestion_service.py      # shared insert→embed→BM25 pipeline
+│   ├── contact_service.py        # mailto: / wa.me link generation — NO LLM, NO webhook
+│   ├── enrichment_services.py    # Google Places review+photo enrichment, CLIP image embed (PAID path)
+│   ├── image_embedding_service.py # NEW — free local-CLIP image embedding using photo URLs
+│   │                                 already in Postgres (Apify-sourced). Same CLIP model and
+│   │                                 same ChromaDB collection as enrichment_services.py's image
+│   │                                 step; only difference is where the URL came from and cost.
+│   └── auth/                     # see backend/services/auth/CLAUDE.md — errors, core, google_oauth,
+│                                     email, rate_limit, audit, totp (7 files, split by concern)
 ├── agents/
-│   ├── configs.py             # 6 agent definitions (role/goal/backstory) + call_agent()
-│   ├── workflow.py            # THE ORCHESTRATOR — see "Agent workflow" section below
-│   └── reranker.py            # standalone reranker (used outside the full workflow)
-├── embedder.py                 # text embedding functions (calls data_enrichment.py for rich text)
-├── vector_store.py             # ALL ChromaDB ops — 3 collections, see "Vector store" section
-├── bm25_store.py                # BM25 build/search, persisted to bm25_index.pkl
-├── retrieval.py                 # RRF fusion of BM25 + dense — the core hybrid_search() function
-├── data_enrichment.py           # cuisine normalisation + name-based cuisine inference + rich text builder
-├── review_summariser.py         # cautious LLM review summarisation with recency weighting
-├── restaurant_fetcher.py        # OSM Overpass + Foursquare fetch (free, weekly sync)
-├── apify_loader.py              # normalize_apify_place() + _load_places() — shared by manual & automated load
-└── apify_automation.py          # resilient Apify run (start→poll→fetch-dataset, survives credit exhaustion)
+│   ├── llm.py                  # AGENT_CONFIGS dict (role/model per agent) + call_agent() — this is
+│   │                              what CLAUDE.md used to call "configs.py"; that file doesn't exist,
+│   │                              the configs live inline in llm.py alongside call_agent() itself
+│   ├── workflow.py              # THE ORCHESTRATOR — see "Agent workflow" section below
+│   └── reranker.py              # standalone, currently UNUSED alternative to workflow.py's Phase 3 —
+│                                    nothing calls it; workflow.py calls call_agent("reranker", ...) directly
+├── retrieving/
+│   ├── embedder.py               # text embedding functions (calls data_enrichment.py for rich text)
+│   ├── vector_store.py            # ALL ChromaDB ops — 3 collections, see "Vector store" section.
+│   │                                 Also where the CLIP model itself lives (_get_clip(), lazy-loaded)
+│   ├── bm25_store.py               # BM25 build/search, persisted to bm25_index.pkl
+│   ├── retrieval.py                 # RRF fusion of BM25 + dense — the core hybrid_search() function
+│   └── data_enrichment.py            # cuisine normalisation + name-based cuisine inference + rich text builder
+└── data_loader/
+    ├── review_summariser.py       # cautious LLM review summarisation with recency weighting
+    ├── restaurant_fetcher.py      # OSM Overpass + Foursquare fetch (free, weekly sync)
+    ├── apify_loader.py            # normalize_apify_place() + _load_places()/_load_places_fill_missing()
+    └── apify_fetcher.py           # resilient Apify run (start→poll→fetch-dataset, survives credit
+                                       exhaustion) — this is the file referred to elsewhere as "apify
+                                       automation"; it was renamed from apify_automation.py at some point
+                                       without every doc being updated, hence this note. ALSO still
+                                       contains generate_contact_messages/generate_whatsapp_url/
+                                       generate_gmail_compose_url/_get_restaurant_contact_method — an
+                                       older LLM-based contact-message approach, fully superseded by
+                                       services/contact_service.py's template-based one. Dead code,
+                                       nothing calls these four. _get_restaurant_contact_method is also
+                                       broken (calls dict-style .get() on a SQLAlchemy ORM object). Safe
+                                       to delete; flagged twice now (once in auth.md's own history, once
+                                       here) without being removed — check with the project owner before
+                                       assuming it's still wanted before deleting.
 
-mcp_service/
-├── mcp_server.py               # FastMCP — exposes search/recommend/feedback as MCP tools
-└── mcp_client.py                # client + ReAct ChatGroq/Gemini loop
+mcp_service/                      # OPTIONAL — not mounted into main.py, run as its own process.
+├── mcp_server.py                  # FastMCP — exposes search/recommend/feedback as MCP tools.
+│                                     See mcp_service/CLAUDE.md.
+└── mcp_client.py                  # client + ReAct ChatGroq/Gemini loop
 
-frontend/
-└── app.py                       # Streamlit, 4 tabs, calls the FastAPI backend over HTTP
+frontend/                         # See frontend/CLAUDE.md for the full login/auth wiring.
+├── app.py                         # Streamlit, 5 tabs (added Account), login-gated via render_login()
+├── login_page.py                  # Login/register/Google/2FA/password-reset/account-linking screens
+└── api_client.py                  # authed_request() — attaches Bearer token, auto-refreshes on 401
 ```
 
 ### Golden rules for this codebase
@@ -93,14 +130,21 @@ frontend/
    ~15 lines of actual logic (not counting docstrings), that logic belongs in
    a service.
 2. **Services never import FastAPI.** Keeps them testable and reusable from
-   scripts, CLI tools, MCP server, etc.
+   scripts, CLI tools, MCP server, etc. The one intentional exception in
+   spirit (not letter) is `services/auth/*` raising a plain `AuthError` —
+   routers translate that to the right HTTP status, so even auth services
+   stay FastAPI-free.
 3. **All Pydantic models live in `models/schemas.py`.** Don't define request
    models inline in routers.
 4. **All env vars go through `core/config.py`.** Never `os.environ.get()`
-   scattered across files.
-5. **Ingestion (writes) is namespaced under `/ingestion/*`** — deliberately
-   separated from reads so RBAC can be bolted on later without touching read
-   endpoints.
+   scattered across files. (This was violated once — `GOOGLE_PLACES_API_KEY`
+   in `enrichment_services.py` — and has been fixed; don't reintroduce it.)
+5. **Ingestion (writes) is namespaced under `/ingestion/*`** and every route
+   there requires `require_admin` — this is now enforced, not aspirational.
+6. **Auth business logic never lives outside `services/auth/`.** Routers in
+   `routers/auth/` should only validate input, call a `services/auth/*`
+   function, and translate `AuthError`/`RateLimitError` to HTTP. See
+   `backend/services/auth/CLAUDE.md`.
 
 ---
 
@@ -258,7 +302,7 @@ only phase that pays for it.
 
 ### Why every prompt says "use only the data provided"
 
-This line is in every single agent's system prompt (`agents/configs.py`).
+This line is in every single agent's system prompt (`agents/llm.py`).
 Combined with the two hallucination guards above (candidate-set
 validation after Phase 1 and Phase 3), this is the project's three-layer
 hallucination defence:
@@ -271,7 +315,7 @@ hallucination defence:
 
 Every `call_agent()` invocation tries Groq (LLaMA 3.3 70B, temp=0.7) first
 and falls back to Gemini 1.5 Flash on ANY exception (rate limit, timeout,
-API error). This fallback is inside `agents/configs.py::call_agent()` —
+API error). This fallback is inside `agents/llm.py::call_agent()` —
 don't reimplement it per-agent.
 
 ### Token optimisation applied throughout workflow.py
@@ -442,7 +486,7 @@ layers of defence:
    `countryCode` present and `!= "PK"` is rejected, counted separately
    as `skipped_wrong_country` in the response.
 
-### apify_automation.py — credit-loss resilience
+### apify_fetcher.py — credit-loss resilience
 
 The naive approach (`run-sync-get-dataset-items`) blocks until the ENTIRE
 actor run finishes and only returns data at the end — if Apify credits
@@ -463,11 +507,11 @@ this happens, so the caller knows to re-run later for the rest.
 ### Reviews/photos are opt-in per Apify call, not automatic
 
 `maxReviews` and `maxImages` must be explicitly set in the actor input
-(`apify_automation.py`) or Apify returns empty `reviews: []` and
+(`apify_fetcher.py`) or Apify returns empty `reviews: []` and
 `imageUrls: []` — this is not an extra API call or extra cost, just a
 parameter that was initially missing.
 
-### enrichment_service.py — Google Places as a secondary path
+### enrichment_services.py — Google Places as a secondary path
 
 For restaurants already in the DB (from Apify without reviews, or from
 OSM/Foursquare which never have reviews), `enrich_restaurants()` uses
@@ -479,6 +523,27 @@ a placeId, does a Text Search first to find one.
 even for the $200/month free credit — this is Google Cloud policy, not
 a bug in our code. If unavailable, Apify (with maxReviews/maxImages set)
 is the only reviews+photos source that requires no card at all.
+
+### image_embedding_service.py — the free counterpart, for photos you already have
+
+`enrichment_services.py`'s image embedding only ever runs as a side
+effect of a paid Google Places Details call. But Apify's `photos`
+column already contains direct, hotlinkable image URLs — no
+`photo_reference` token, no Google API call needed to resolve one.
+`image_embedding_service.embed_restaurant_photos()` downloads those
+URLs directly and calls the exact same `vector_store.upsert_restaurant_image()`
+/ CLIP model as the Google path — same collection, same vector space,
+zero marginal cost beyond bandwidth and local compute. Exposed as
+`POST /ingestion/embed-restaurant-images`. Idempotent — a restaurant is
+skipped once every URL in its `photos` list has a matching
+`image_index` already in ChromaDB, so it's safe to call again after
+every new Apify sync.
+
+Don't confuse this with a "second, different implementation" — it's
+the same `_get_clip()` / `embed_image_from_bytes()` in `vector_store.py`
+either way. The two services just differ in **where the URL comes
+from** (already in Postgres vs. fetched fresh from Google) and
+**what it costs** (free vs. ~$0.017/restaurant).
 
 ---
 
@@ -548,9 +613,19 @@ user-facing.
 
 ## MCP server (`mcp_service/mcp_server.py`)
 
-Exposes 5 tools + 1 resource over stdio transport, so any MCP client
-(Claude Desktop, this project's own `mcp_client.py`, or other agents)
-can call the backend without going through the REST API:
+Optional, standalone — NOT mounted into `main.py`, run as its own
+process (`python mcp_service/mcp_server.py`) only if you want MCP tool
+access (Claude Desktop, this project's own `mcp_client.py`, or other
+agents). The main app runs fully without it. See `mcp_service/CLAUDE.md`
+for the full picture, including a real bug that was in here for a
+while: it imported `Restaurant` from `models.schemas` (a Pydantic
+module with no such class) instead of `models.db_models` (the actual
+SQLAlchemy ORM class `select(Restaurant)` needs) — meaning this file
+could not even be imported, let alone run, until that was fixed. If
+you're reading an old commit or a stale clone, check that import first
+before debugging anything else in this file.
+
+Exposes 5 tools + 1 resource over stdio transport:
 
 ```
 search_restaurants     → retrieval.hybrid_search()
@@ -568,16 +643,59 @@ convention but everything underneath is async SQLAlchemy.
 
 ---
 
+## Authentication & authorization (`services/auth/`, `routers/auth/`)
+
+Full design detail, Redis key namespaces, and the reasoning behind
+every security choice: **`backend/services/auth/CLAUDE.md`**. Summary
+for orientation:
+
+- Self-hosted (no third-party auth provider) — email/password +
+  Google OAuth (Authorization Code flow) both issue the same JWT
+  access/refresh token pair. Admin is a `role` column on the same
+  `User`/JWT system, not a separate API key or service.
+- `/ingestion/*` requires `require_admin`; nothing else in the app
+  requires auth at the router level (search/recommend stay public by
+  design) except the `/auth/*` routes that explicitly need a session
+  (`/auth/me`, `/auth/sessions`, `/auth/2fa/*`, `/auth/deactivate`).
+- Also covers: password reset, account deactivation, session/device
+  listing + revocation, TOTP 2FA, Redis-backed rate limiting on
+  register/resend-verification/forgot-password, login lockout after 5
+  failed attempts, and an append-only `audit_logs` table.
+- The frontend's login/register/2FA/linking screens and the
+  `authed_request()` pattern every other frontend call goes through
+  are covered in `frontend/CLAUDE.md`, not here.
+
+---
+
 ## Environment variables (`core/config.py`)
 
+Full reference with explanations: `.env.example` — that file is
+generated from this module's actual `Settings` class, so trust the
+code over any doc if they ever drift.
+
 ```
-NEON_DATABASE_URL        # required — PostgreSQL connection string
-GROQ_API_KEY              # required — primary LLM
-GOOGLE_API_KEY             # required — Gemini fallback LLM
-APIFY_API_TOKEN            # required for Apify sync — no card needed, $5/mo free
-FOURSQUARE_API_KEY         # optional — base place search only, reviews/photos are Premium-only (paid)
-GOOGLE_PLACES_API_KEY      # optional — requires a billing card, $200/mo free credit
-N8N_WEBHOOK_URL             # legacy, not currently used by any active endpoint
+# Required
+NEON_DATABASE_URL          # PostgreSQL connection string
+JWT_SECRET_KEY              # generate: python -c "import secrets; print(secrets.token_urlsafe(64))"
+
+# At least one required (Groq tried first, Gemini as fallback)
+GROQ_API_KEY
+GOOGLE_API_KEY
+
+# Required for Apify ingestion; everything below is optional and
+# degrades gracefully without it
+APIFY_API_TOKEN             # no card needed, $5/mo free
+FOURSQUARE_API_KEY          # base place search only, reviews/photos are Premium-only (paid)
+GOOGLE_PLACES_API_KEY       # requires a billing card, $200/mo free credit
+GOOGLE_CLIENT_ID            # Google sign-in
+GOOGLE_CLIENT_SECRET
+REDIS_URL                    # defaults to redis://localhost:6379/0
+JWT_ACCESS_EXPIRE_MINUTES     # default 30
+JWT_REFRESH_EXPIRE_DAYS        # default 7
+BACKEND_URL                     # default http://localhost:8000 — where emailed links point
+FRONTEND_URL                     # default http://localhost:8501
+SMTP_HOST / PORT / USER / PASSWORD   # unset → verification/reset links print to console instead
+N8N_WEBHOOK_URL                        # legacy, not currently used by any active endpoint
 ```
 
 ---
@@ -591,17 +709,25 @@ bash run.sh                                    # option 3 = backend + frontend
 # Manual
 uvicorn backend.main:app --reload
 streamlit run frontend/app.py
-python mcp_service/mcp_server.py
+python mcp_service/mcp_server.py               # optional
+
+# Get an admin token first — every /ingestion/* call below needs it
+TOKEN=$(curl -s -X POST http://localhost:8000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"you@example.com","password":"yourpassword123"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
 
 # Ingest data
-curl -X POST "http://localhost:8000/ingestion/n8n/sync-apify?per_city_limit=50"
-curl -X POST http://localhost:8000/ingestion/summarise-all-reviews
-curl -X POST "http://localhost:8000/ingestion/enrich-reviews?limit=10&embed_images=true"
+curl -X POST "http://localhost:8000/ingestion/n8n/sync-apify?per_city_limit=50" -H "Authorization: Bearer $TOKEN"
+curl -X POST http://localhost:8000/ingestion/summarise-all-reviews -H "Authorization: Bearer $TOKEN"
+curl -X POST "http://localhost:8000/ingestion/embed-restaurant-images?limit=10" -H "Authorization: Bearer $TOKEN"   # free, local CLIP
+curl -X POST "http://localhost:8000/ingestion/enrich-reviews?limit=10&embed_images=true" -H "Authorization: Bearer $TOKEN"  # paid, Google Places
 
-# Check state
+# Check state (also admin-gated)
+curl http://localhost:8000/ingestion/enrich-status -H "Authorization: Bearer $TOKEN"
+curl http://localhost:8000/ingestion/n8n/apify-status -H "Authorization: Bearer $TOKEN"
+
+# Check state (public)
 curl http://localhost:8000/vector-stats
-curl http://localhost:8000/ingestion/enrich-status
-curl http://localhost:8000/ingestion/n8n/apify-status
 ```
 
 ---
@@ -621,6 +747,15 @@ curl http://localhost:8000/ingestion/n8n/apify-status
   only the soft one.
 - Don't re-introduce `run-sync-get-dataset-items` for Apify — it loses
   data on credit exhaustion. Always use the start→poll→fetch-dataset
-  pattern in `apify_automation.py`.
+  pattern in `apify_fetcher.py`.
 - Don't route contact messages through n8n or an LLM — `contact_service.py`
   is intentionally template-based and client-side only.
+- Don't add password/session/token logic anywhere outside `services/auth/`
+  — routers only validate input and translate exceptions. See
+  `backend/services/auth/CLAUDE.md`'s own "don't" list for auth-specific
+  pitfalls (exception ordering, Redis key collisions, etc.) — they're
+  detailed enough to deserve their own file rather than duplicating here.
+- Don't call `requests`/`httpx` directly from a Streamlit script body
+  without a try/except — a body-level call executes on every rerun of
+  every tab, so one network hiccup can crash the whole page, not just
+  the feature that made the call. See `frontend/CLAUDE.md`.

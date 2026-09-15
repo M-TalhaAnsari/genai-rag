@@ -32,6 +32,7 @@ from backend.data_loader.apify_loader import load_apify_export, _load_places, _l
 from backend.data_loader.apify_loader import build_search_terms
 
 from backend.data_loader.review_summariser import summarise_reviews as _summarise
+from backend.services import image_embedding_service
 
 from backend.data_loader.apify_fetcher import (_run_apify_scraper_resilient,_log_run, 
                                                _mark_snapshot_processed, 
@@ -233,6 +234,37 @@ async def summarise_all_reviews(db: AsyncSession = Depends(get_db)):
             errors.append(f"{restaurant.name}: {e}")
 
     return {"summarised": done, "skipped": skipped, "errors": errors[:10]}
+
+
+# ── Batch image embedding (free, local CLIP) ───────────────────────────────
+
+@router.post("/embed-restaurant-images", dependencies=[Depends(require_admin)])
+async def embed_restaurant_images(
+    limit: int | None = Query(
+        default=50,
+        description="Max restaurants to process this run. Start small (10) to test — the "
+                    "first call in a process downloads the ~600MB CLIP model. None = all."
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Free, local-CLIP counterpart to /ingestion/enrich-reviews's image
+    embedding — embeds the photo URLs restaurants ALREADY have (from
+    Apify) instead of fetching new ones from Google Places. No API
+    key, no billing card, no per-restaurant cost: CLIP runs locally on
+    CPU (or GPU if available). See services/image_embedding_service.py
+    for why this exists as a separate path from the Google one.
+
+    Safe to re-run — restaurants with every photo already embedded are
+    skipped automatically, so call this again after any new Apify sync
+    that added photos to more restaurants.
+
+    Run order:
+      1. POST /ingestion/embed-restaurant-images?limit=10   ← test first
+      2. GET  /ingestion/enrich-status                       ← check image_vectors_total
+      3. POST /ingestion/embed-restaurant-images?limit=None  ← run on everything
+    """
+    return await image_embedding_service.embed_restaurant_photos(db, limit=limit)
 
 
 # ── n8n automated Apify sync ───────────────────────────────────────────────
@@ -521,4 +553,5 @@ async def enrich_status(db: AsyncSession = Depends(get_db)):
         "total_reviews":             total_reviews,
         "with_photos":               have_photos,
         "review_summaries_in_chroma": review_collection_count(),
+        "image_vectors_total":       vector_store.image_collection_count(),
     }

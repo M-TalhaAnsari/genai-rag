@@ -1,236 +1,201 @@
-# Connoisseur — Auth System Status
+# Auth system — `backend/services/auth/` + `backend/routers/auth/`
 
-Last updated: 2026-08-23
+Self-hosted email/password + Google OAuth, JWT access/refresh tokens,
+TOTP 2FA, session management, password reset, account deactivation,
+rate limiting, and an audit log. No third-party auth provider — admin
+is a `role` column on the same `User` table, not a separate system.
 
-This tracks what's been built, what's actually been tested end-to-end, and what's
-still missing before this auth system is production-ready. Use the checkboxes as
-your working list.
+Read this before touching anything under `services/auth/` or
+`routers/auth/` — several of the design choices here exist because an
+earlier, simpler version had a real bug, and the fix is easy to
+accidentally undo by "simplifying" it back.
 
 ---
 
-## 1. Architecture summary
-
-Self-hosted auth (no third-party auth provider like Auth0/Clerk). Two entry
-points that converge on the same JWT session system:
-
-- **Email + password**, gated by email verification
-- **Google OAuth (Authorization Code flow)**, using OpenID Connect's
-  `id_token` for identity
+## File map
 
 ```
-Local:
-  register → row created, email_verified=False → email sent → NOT logged in
-  login    → blocked until email_verified=True
-  verify-email(token) → flips email_verified=True → issues tokens
+services/auth/
+├── errors.py       AuthError — its own module specifically so core.py
+│                    and rate_limit.py can both depend on it without
+│                    importing each other (rate_limit.RateLimitError
+│                    subclasses AuthError)
+├── core.py          password hashing, JWT issue/rotate/revoke, email
+│                     verification, password reset, account deactivation,
+│                     session list/revoke, TOTP enrollment/verification
+├── google_oauth.py  Authorization Code flow + account linking (Case 2)
+├── email.py         outbound email — verification + password reset links
+├── rate_limit.py     Redis fixed-window rate limiting + login lockout
+├── audit.py           append-only writes to the audit_logs table
+└── totp.py             RFC 6238 TOTP, stdlib only (hmac/hashlib/base64/struct)
 
-Google:
-  callback → google_id already known? → login_code → exchange → tokens
-           → new email, no local match? → create verified user → login_code → tokens
-           → email matches an existing LOCAL account? → link_token
-                → frontend prompts password → link-confirm → tokens
+routers/auth/
+├── local.py    everything except Google — 20 routes total across both files
+├── google.py    OAuth login/callback/exchange/link-confirm
+└── auth.md      session-by-session build notes — HISTORY, not current-state
+                  truth. Useful for "why does this exist" archaeology; this
+                  CLAUDE.md file is the one to trust for current behavior.
 ```
 
-### Why `google_id` (the `sub` claim), not email, is the identity key
-
-Email can change or be reassigned; Google's `sub` claim is permanent for a
-given Google account. `google_id` is the column matched first on every
-Google login — email is only a fallback used to detect a linking scenario.
-
-### Why account linking requires a password, not just an email match
-
-Silently linking a Google identity to any local account with a matching
-email is an account-takeover vector: an attacker could register locally
-using someone else's email (nothing stops that at register time — see
-open gap below), then have the real owner's later "Continue with Google"
-click silently attached to the attacker's local account. Requiring the
-local account's password before linking closes this.
-
-### Why register no longer issues a token pair
-
-Previously, `/register` returned real tokens immediately — meaning an
-unverified account got a live session before anyone proved the email was
-real. That's the same class of trust mistake as auto-linking. Register's
-job is now narrower: create an inert, unverified row and send proof of
-ownership to the one channel that matters (the inbox). Only
-`/verify-email` (proof arrived) or `/login` (proof already happened
-earlier) issue real sessions.
-
 ---
 
-## 2. What's implemented
+## Why `AuthError` lives in its own file
 
-| Component | File |
-|---|---|
-| Password hashing, JWT encode/decode | `core/security.py` |
-| Register / login / refresh / logout business logic | `services/auth_service.py` |
-| Email verification (token issue/redeem, stale-account reclaim) | `services/auth_service.py` |
-| Dev-mode email sending (console fallback, real SMTP when configured) | `services/email_service.py` |
-| Google OAuth flow (state, token exchange, id_token verification, get-or-create) | `services/google_oauth_service.py` |
-| All auth HTTP routes | `routers/auth.py` |
-| `email_verified` column + backfill for pre-existing Google users | `alembic/versions/0003_email_verification.py` |
+`core.py`'s `authenticate_user()` needs to check login lockout, which
+lives in `rate_limit.py`. `rate_limit.py`'s `RateLimitError` needs to
+subclass `AuthError` so routers can catch either uniformly. If
+`AuthError` lived in `core.py`, that would make `rate_limit.py` import
+`core.py` AND `core.py` import `rate_limit.py` — a circular import that
+fails at module load time, not at some obscure runtime edge case. Verified
+concretely: `issubclass(rate_limit.RateLimitError, auth_service.AuthError)`
+and `auth_service.AuthError is google_oauth_service.AuthError` are both
+`True` at runtime with this structure — don't reintroduce the cycle by
+moving `AuthError` back into `core.py` "for simplicity."
 
-### Security properties in place
+## Exception ordering — the one thing every router handler must get right
 
-- CSRF protection on OAuth via single-use, Redis-backed `state` (10 min TTL)
-- `id_token` signature verified via Google's official `google-auth` library
-  (JWKS fetch/cache/RS256 handled by Google, not hand-rolled)
-- `email_verified` claim from Google checked before trusting a Google email
-- Real tokens never appear in a redirect URL — one-time `login_code`
-  (60s TTL) is exchanged for the real pair via a POST body
-- Refresh tokens rotate on every use; reuse of an already-used refresh
-  token is detectable (`revoked` flag + `jti` tracking)
-- Account linking requires proof of the local account's password
-  (`link_token`, 5 min TTL, single use)
-- Generic "incorrect email or password" / no-op `resend-verification`
-  responses — neither leaks whether an email is registered
+`RateLimitError` **subclasses** `AuthError`. Every `except` block that
+handles both must catch `RateLimitError` FIRST:
 
----
-
-## 3. Test status
-
-### ✅ Confirmed working (manually tested this session)
-
-- [x] Local register → row created with `email_verified=False`, no session issued
-- [x] Login blocked with "please verify your email" before verification
-      *(note: this only fires after email/password match — verify your
-      curl bodies are byte-identical between register and login if you
-      see "incorrect email or password" instead)*
-- [x] Google OAuth — brand new user (no prior local account)
-  - `email_verified=True`, `auth_provider='google'`, `hashed_password` null
-  - Confirmed via direct DB query
-- [x] CSRF `state` protection — reusing an old callback URL correctly
-      fails with "Invalid or expired OAuth state"
-- [x] Clock-skew sensitivity in `id_token` verification — hit and fixed
-      a real "Token used too early" error (Windows Time service issue)
-- [x] One-time `login_code` → `/auth/google/exchange` → real token pair
-
-### ⏳ Implemented but not yet manually verified
-
-- [ ] `/auth/verify-email` — flips `email_verified`, issues tokens
-      *(logic shared with tested paths, but never run directly with a
-      real printed token)*
-- [ ] `/auth/resend-verification` — sends a fresh token; returns 204
-      even for unknown/already-verified emails
-- [ ] **Account linking (Case 2)** — existing local account + Google
-      sign-in with the same email → `link_required` redirect →
-      `/auth/google/link-confirm` with local password → `google_id`
-      attached, `auth_provider` becomes `'google_and_local'`
-      **This is the actual security fix from this session — test it
-      before considering auth "done."**
-- [ ] Google OAuth — already-linked user logs in again → should go
-      straight to `login_code`, no `link_required` prompt
-- [ ] Refresh token rotation — old token fails after a new one is issued
-- [ ] Logout — refresh token fails after logout
-
-### ⚠️ Known gaps / open bugs
-
-- [ ] **Duplicate-register on the same unverified email was never
-      cleanly re-confirmed to return 409.** Was tested once with an
-      ambiguous result (see conversation history) — re-run this
-      specifically:
-      ```bash
-      curl -X POST http://localhost:8000/auth/register \
-        -d '{"email":"same@example.com","password":"x"}'
-      # then immediately again with the same email
-      # second call should be 409, not 201
-      ```
-- [ ] **Email case-sensitivity** — `Test@x.com` and `test@x.com` are
-      currently treated as different DB rows. Should lowercase email on
-      both write and lookup, everywhere (register, login,
-      resend-verification, Google linking).
-- [ ] **No rate limiting** on `/register` or `/resend-verification` —
-      an attacker can spam verification emails to any address.
-- [ ] Minor race: two near-simultaneous registrations on the same
-      stale-unverified email could both attempt delete+recreate.
-      Low priority.
-- [ ] `/auth/verify-email` is currently a **POST** requiring the token
-      in a JSON body — meaning a real user can't just click the emailed
-      link, they'd need a frontend page that reads the token and POSTs
-      it. Consider converting to a GET route (token in query/path) that
-      redirects to the frontend with a success/failure flag, so
-      clicking the email link works directly.
-
----
-
-## 4. Frontend (Streamlit) — not yet wired up
-
-The backend redirects to `FRONTEND_URL` with query params the Streamlit
-app needs to read via `st.query_params`:
-
-| Redirect param | Meaning | Frontend action needed |
-|---|---|---|
-| `?login_code=...` | Google login succeeded | POST to `/auth/google/exchange`, store tokens in `st.session_state`, clear query param |
-| `?link_required=...&email=...` | Existing local account, needs password to link | Show a password field, POST to `/auth/google/link-confirm` |
-| `?auth_error=...` | Something failed (bad state, invalid token, etc.) | Display as an error message |
-
-Additional frontend pieces needed:
-- Register form → POST `/auth/register`, then show "check your email"
-- Login form → POST `/auth/login`
-- A way to handle the verification link (see the GET-route conversion
-  note above — this is the cleanest fix)
-- Token storage strategy in `st.session_state`, and wiring every
-  authenticated API call to attach the access token + retry once
-  through `/auth/refresh` on a 401 (this was mentioned as designed but
-  not yet fully wired in an earlier session — confirm current state)
-
----
-
-## 5. Beyond MVP — not started, not blocking
-
-Standard production auth features not yet touched. None block shipping
-the current scope, but list them here so they don't get forgotten:
-
-- [ ] Password reset flow (forgot-password → email link → set new password)
-- [ ] Account deletion / deactivation endpoint
-- [ ] Session/device management (list + revoke individual sessions)
-- [ ] Login attempt throttling / brute-force protection on `/login`
-- [ ] Audit log of auth events (login, failed login, password change,
-      account linked)
-- [ ] Two-factor authentication (optional)
-
----
-
-## 6. Environment variables required
-
-```env
-# Google OAuth — from console.cloud.google.com/apis/credentials
-GOOGLE_CLIENT_ID=...
-GOOGLE_CLIENT_SECRET=...
-GOOGLE_REDIRECT_URI=http://localhost:8000/auth/google/callback   # must match Console EXACTLY
-
-# Frontend
-FRONTEND_URL=http://localhost:8501
-
-# Email (optional for dev — falls back to console-printed links if unset)
-SMTP_HOST=
-SMTP_PORT=587
-SMTP_USER=
-SMTP_PASSWORD=
-SMTP_FROM=noreply@connoisseur.app
+```python
+try:
+    user = await auth_service.authenticate_user(db, email, password)
+except RateLimitError as e:          # MUST come first
+    raise _rate_limit_http(e)
+except auth_service.AuthError as e:  # catches everything else
+    raise HTTPException(401, str(e))
 ```
 
-**Common first-run failures and their fixes (all hit and resolved this session):**
-- `AttributeError: 'Settings' object has no attribute 'GOOGLE_CLIENT_ID'`
-  → field not declared on the `Settings` class in `core/config.py`, or
-  `.env` not loaded
-- `redirect_uri_mismatch` from Google → the URI in `.env` doesn't
-  character-match what's registered in Google Cloud Console (trailing
-  slash, `localhost` vs `127.0.0.1`)
-- `Token used too early` → system clock drift; sync Windows Time
-  service (`net start w32time` → `w32tm /resync /force`) or set the
-  clock manually if NTP is blocked
-- `Invalid or expired OAuth state` → reused an old `/callback` URL
-  (browser back button, cached tab) instead of starting a fresh
-  `/auth/google/login` call each time; `state` is single-use by design
+Reversed, the generic `AuthError` branch would swallow lockouts and
+return a misleading 401 instead of 429 — the person would think their
+password is wrong, not that they're locked out. This bit `login()` in
+`routers/auth/local.py` during development; check any new endpoint that
+touches `authenticate_user()` or the rate-limited endpoints for this
+same ordering.
+
+## Redis key namespaces
+
+Every short-lived token uses its own prefix — deliberately, so a leak
+of one Redis key never enables anything beyond its specific flow:
+
+| Prefix | Set by | TTL | Notes |
+|---|---|---|---|
+| `email_verify:{token}` | `send_verification_email` | 24h | single-use |
+| `login_code:{code}` | `create_login_code` | 60s | **shared** between the Google-exchange flow and the email-verify-link flow — `/auth/google/exchange` doesn't care which flow produced the code, it just redeems whatever's under this key. Deliberate reuse, not an accident. |
+| `link_token:{token}` | google_oauth.py (Case 2) | short | account-linking confirmation |
+| `password_reset:{token}` | `request_password_reset` | 30 min | single-use, revokes ALL sessions on success |
+| `mfa_token:{token}` | `create_mfa_token` | 5 min | issued after a correct password when 2FA is on; **not single-use on a wrong code** — see below |
+| `login_fail:{email}` | `record_login_failure` | 15 min | failure counter |
+| `login_lockout:{email}` | `record_login_failure` at 5 failures | 15 min | the actual lockout flag |
+| `ratelimit:register:{ip}` | `check_rate_limit` | 1h | 5/hr |
+| `ratelimit:resend:{email}` / `ratelimit:forgot-password:{email}` | `check_rate_limit` | 1h | 3/hr each |
+
+**Why `mfa_token` isn't burned on a wrong code:** `redeem_mfa_token()`
+only reads the key; `verify_mfa_code()` deletes it only after a
+*correct* TOTP code. If a wrong code burned the token immediately, a
+user who fat-fingers their 6 digits would have to re-enter their
+password to get a new `mfa_token` — annoying and unnecessary, since the
+token only proves "this caller already knows the password," not
+anything about the TOTP code itself. Don't "fix" this into single-use;
+it's already correct.
+
+## Login lockout is keyed by email, not IP
+
+An attacker rotating IPs still gets locked out this way. The tradeoff —
+someone else could theoretically get locked out if an attacker targets
+their exact email from many IPs — is the standard cost every
+account-lockout scheme accepts. This is checked in `authenticate_user()`
+**before the database is even touched**, so a locked-out email doesn't
+leak whether the account exists via response timing either.
+
+## Password reset revokes every session, not just the current one
+
+`reset_password()` calls `revoke_all_user_tokens()` on success. A
+password reset is the highest-confidence "this session may be
+compromised" signal short of an explicit report — a stolen session
+shouldn't outlive the password that (maybe) leaked it. Don't scope this
+down to "just the token that requested the reset."
+
+## Account deactivation and 2FA-disable both skip the password check for Google-only accounts
+
+`user.hashed_password is None` means the account was created purely via
+Google OAuth and never set a local password. `deactivate_account()` and
+`disable_totp()` both check `if user.hashed_password is not None:
+require password` — for a Google-only account, holding a valid access
+token (i.e., already being logged in) is the only re-auth available,
+since there's no password to check. Don't add a hard password
+requirement here; it would make these actions impossible for Google-only
+accounts.
+
+## 2FA enrollment is two steps on purpose
+
+`setup_totp()` generates and stores a secret WITHOUT setting
+`totp_enabled = True`. Only `confirm_totp()` — which requires a valid
+code from that secret — flips the flag. This means a user who scans the
+QR into the wrong app, or just closes the tab mid-setup, can't
+accidentally lock themselves out of their own account. Don't collapse
+this into one step "for simplicity" — the two-step design IS the safety
+mechanism.
+
+## TOTP is hand-rolled, not `pyotp` — verified against the actual RFC
+
+`totp.py` is ~50 lines against RFC 4226 (HOTP) / RFC 6238 (TOTP), stdlib
+only. This was a deliberate choice over adding a dependency for
+something this security-sensitive and this small — but "small and
+hand-rolled" only stays safe if it's actually correct, so it was
+verified against all 10 official RFC 4226 Appendix D test vectors
+before being trusted:
+
+```python
+secret_ascii = b'12345678901234567890'  # the RFC's own test secret
+# counters 0-9 → 755224, 287082, 359152, 969429, 338314,
+#                254676, 287922, 162583, 399871, 520489
+# all 10 matched exactly
+```
+
+If you ever touch `_hotp()` or `verify_totp()`, re-run this test before
+trusting the change — a subtly wrong TOTP implementation fails silently
+(codes just don't verify) rather than throwing an obvious error.
+
+## The `hashed_password` migration trap — read this before running `alembic revision --autogenerate`
+
+`User.hashed_password` in `db_models.py` must stay `nullable=True`
+(Google-only accounts have no password). It was `nullable=False` in the
+original schema, then made nullable in `0002_google_oauth.py` — but the
+**model file itself was never updated to match**, so any later
+`alembic revision --autogenerate` will see model (`nullable=False`) vs.
+actual DB (`nullable=True`) as drift and generate a migration that
+silently flips it back to `NOT NULL`. This actually happened once
+(migration `65b9f0789708`, originally about an unrelated refresh-token
+timezone fix) and was caught and stripped out before causing damage.
+The model now correctly says `nullable=True` — if you ever see
+autogenerate propose an `alter_column('users', 'hashed_password',
+nullable=False)`, that's this same class of bug resurfacing, not a
+legitimate change to make.
+
+## Account linking (Case 2) reuses the `login_code` Redis namespace
+
+When someone with an existing local/password account clicks "Continue
+with Google" using the same email, `google_oauth.py` doesn't silently
+merge accounts — it issues a `link_token` and redirects the frontend to
+a "confirm with your password" screen (`_render_link_confirm()` in
+`login_page.py`). Only after that password check succeeds does it issue
+real tokens. Don't skip the password confirmation step even though it
+feels redundant with "they already proved they own the Google account"
+— the whole point is proving they *also* own the local account, since
+Google's own email verification and this app's are two different trust
+chains.
 
 ---
 
-## 7. Suggested next-session order
+## What's NOT implemented here (see root CLAUDE.md's cleanup table / README for status)
 
-1. Re-confirm duplicate-register returns 409 (open question, never cleanly closed)
-2. Fix email lowercasing (small, prevents a real class of bugs)
-3. Test account linking (Case 2) end-to-end with a real second Gmail address
-4. Convert `/verify-email` to a clickable GET route
-5. Wire up Streamlit frontend (query param handling, forms, token storage, refresh-on-401)
-6. Test refresh rotation + logout
-7. Decide which "beyond MVP" items (section 5) are actually needed before real users touch this
+- No rate limiting on `/login` beyond the lockout (lockout IS the login
+  rate limit — there's no separate per-IP throttle on it, only per-email)
+- Session list (`GET /auth/sessions`) marks "current" via IP+user-agent
+  match, not an exact identifier — the access token itself carries no
+  `jti` (only the refresh token does), so this is a best-effort signal,
+  not a guarantee, on shared IPs (e.g. two tabs behind the same NAT/proxy)
+- No admin-facing view of the `audit_logs` table yet — it's written to,
+  but nothing reads it back out through the API. Query it directly in
+  Postgres for now.
